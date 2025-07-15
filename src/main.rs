@@ -6,18 +6,12 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
-use axum::{
-    extract::State,
-    http::StatusCode,
-    response::Json,
-    routing::get,
-    Router,
-};
+use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use base64::Engine;
 use clap::Parser;
 use serde_json::{json, Value};
 use std::{
-    str::FromStr, 
+    str::FromStr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -116,7 +110,8 @@ struct BitcoinRpc {
 
 impl BitcoinRpc {
     fn new(url: String, user: String, password: String) -> Self {
-        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password));
+        let auth =
+            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password));
         Self {
             client: reqwest::Client::new(),
             url,
@@ -203,8 +198,11 @@ impl AdminService {
     }
 
     async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn std::error::Error>> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
         // Get current block height
         let current_height = match self.bitcoin_rpc.get_block_count().await {
             Ok(height) => {
@@ -224,7 +222,7 @@ impl AdminService {
                 return Err(e);
             }
         };
-        
+
         // Calculate the height for the confirmation block
         let target_height = if current_height >= self.confirmation_blocks {
             current_height - self.confirmation_blocks
@@ -235,14 +233,18 @@ impl AdminService {
 
         // Get the block hash at the target height
         let block_hash_str = self.bitcoin_rpc.get_block_hash(target_height).await?;
-        
+
         // Convert hex string to B256
         let block_hash = B256::from_str(&block_hash_str)?;
 
         Ok((current_height, block_hash))
     }
 
-    async fn update_contract(&self, block_height: u64, block_hash: B256) -> Result<(), Box<dyn std::error::Error>> {
+    async fn update_contract(
+        &self,
+        block_height: u64,
+        block_hash: B256,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         info!(
             "Updating contract with block height {} and hash 0x{}",
             block_height,
@@ -268,7 +270,7 @@ impl AdminService {
             .await?;
 
         let receipt = tx.get_receipt().await?;
-        
+
         info!(
             "Transaction successful: 0x{} (block: {})",
             hex::encode(receipt.transaction_hash),
@@ -279,7 +281,10 @@ impl AdminService {
         if let Ok(mut status) = self.health_status.write() {
             status.sequencer_rpc_healthy = true;
             status.last_contract_update = Some(
-                SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs()
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs(),
             );
             status.total_updates += 1;
         }
@@ -289,7 +294,7 @@ impl AdminService {
 
     async fn run(&self, update_interval: Duration) {
         let mut interval = time::interval(update_interval);
-        
+
         info!("Starting Sova Bitcoin Sync Service...");
         info!("Update interval: {} seconds", update_interval.as_secs());
         info!("Confirmation blocks: {}", self.confirmation_blocks);
@@ -327,7 +332,9 @@ impl AdminService {
 }
 
 // Health check handlers
-async fn health_check(State(health_status): State<Arc<RwLock<HealthStatus>>>) -> Result<Json<Value>, StatusCode> {
+async fn health_check(
+    State(health_status): State<Arc<RwLock<HealthStatus>>>,
+) -> Result<Json<Value>, StatusCode> {
     match health_status.read() {
         Ok(status) => {
             let is_healthy = status.is_healthy();
@@ -352,11 +359,13 @@ async fn health_check(State(health_status): State<Arc<RwLock<HealthStatus>>>) ->
                 Err(StatusCode::SERVICE_UNAVAILABLE)
             }
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
-async fn readiness_check(State(health_status): State<Arc<RwLock<HealthStatus>>>) -> Result<Json<Value>, StatusCode> {
+async fn readiness_check(
+    State(health_status): State<Arc<RwLock<HealthStatus>>>,
+) -> Result<Json<Value>, StatusCode> {
     match health_status.read() {
         Ok(status) => {
             // Service is ready if it has started and both RPCs are healthy
@@ -373,7 +382,7 @@ async fn readiness_check(State(health_status): State<Arc<RwLock<HealthStatus>>>)
                 Err(StatusCode::SERVICE_UNAVAILABLE)
             }
         }
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR)
+        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
 
@@ -381,7 +390,10 @@ async fn liveness_check() -> Json<Value> {
     Json(json!({ "status": "alive" }))
 }
 
-async fn start_health_server(health_status: Arc<RwLock<HealthStatus>>, port: u16) -> Result<(), Box<dyn std::error::Error>> {
+async fn start_health_server(
+    health_status: Arc<RwLock<HealthStatus>>,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
@@ -391,7 +403,7 @@ async fn start_health_server(health_status: Arc<RwLock<HealthStatus>>, port: u16
 
     let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
     info!("Health check server running on port {}", port);
-    
+
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -407,12 +419,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create the admin service
     let service = AdminService::new(&args).await?;
     let update_interval = Duration::from_secs(args.update_interval);
-    
+
     // Get health status for the health server
     let health_status = service.get_health_status();
     let health_port = args.health_port;
 
-    info!("Starting Sova Bitcoin Sync Service with health checks on port {}", health_port);
+    info!(
+        "Starting Sova Bitcoin Sync Service with health checks on port {}",
+        health_port
+    );
 
     // Run both the sync service and health server concurrently
     tokio::select! {
