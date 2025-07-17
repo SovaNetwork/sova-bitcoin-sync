@@ -62,15 +62,16 @@ jobs:
         uses: docker/setup-buildx-action@v3
         with:
           driver: docker-container
+          builder-name: cross-builder
           use: true
           install: true
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
+          builder: cross-builder
           context: .
           push: true
-          builder: default
           platforms: linux/amd64,linux/arm64
           tags: |
             ${{ env.DOCKER_IMAGE_NAME }}:${{ needs.extract-version.outputs.VERSION }}
