@@ -63,10 +63,12 @@ jobs:
         with:
           driver: docker-container
           builder-name: cross-builder
+          create: true
           use: true
           install: true
 
       - name: Build and push Docker image
+        if: needs.extract-version.outputs.VERSION != 'unknown'
         uses: docker/build-push-action@v5
         with:
           builder: cross-builder
@@ -82,3 +84,7 @@ jobs:
       - name: Inspect pushed image manifest
         run: |
           docker buildx imagetools inspect ${{ env.DOCKER_IMAGE_NAME }}:${{ needs.extract-version.outputs.VERSION }}
+
+      - name: Remove builder
+        if: always()
+        run: docker buildx rm cross-builder || true
