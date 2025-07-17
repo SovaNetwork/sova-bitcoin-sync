@@ -8,14 +8,33 @@ on:
   workflow_dispatch:
 
 env:
+  REPO_NAME: ${{ github.repository_owner }}/sova-sentinel
+  IMAGE_NAME: ${{ github.repository_owner }}/sova-sentinel
   CARGO_TERM_COLOR: always
-  DOCKER_IMAGE_NAME: ghcr.io/sovanetwork/sova-bitcoin-sync
+  DOCKER_IMAGE_NAME: ghcr.io/sovanetwork/sova-sentinel
   DOCKER_USERNAME: ${{ github.actor }}
 
 jobs:
+  extract-version:
+    runs-on: ubuntu-24.04
+    outputs:
+      VERSION: ${{ steps.set.outputs.VERSION }}
+    steps:
+      - name: Set VERSION from GITHUB_REF
+        id: set
+        run: |
+          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            echo "VERSION=latest" >> "$GITHUB_OUTPUT"
+          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "VERSION=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
     name: build and push
     runs-on: ubuntu-24.04
+    needs: extract-version
     permissions:
       packages: write
       contents: read
@@ -31,36 +50,33 @@ jobs:
 
       - uses: taiki-e/install-action@cross
 
-      - name: Set version tag
-        id: version
-        run: |
-          if [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
-            echo "VERSION=latest" >> $GITHUB_OUTPUT
-          elif [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          else
-            echo "VERSION=unknown" >> $GITHUB_OUTPUT
-          fi
-        shell: bash
-
       - name: Log in to Docker
         run: |
           echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io --username ${DOCKER_USERNAME} --password-stdin
 
-      - name: Set up Docker builder
+      - name: Install binfmt for multi-arch support
         run: |
           docker run --privileged --rm tonistiigi/binfmt --install arm64,amd64
-          docker buildx create --name cross-builder --use
-          docker buildx inspect --bootstrap
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          use: true
+          install: true
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
+          builder: default
           platforms: linux/amd64,linux/arm64
           tags: |
-            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.version.outputs.VERSION }}
-            ${{ steps.version.outputs.VERSION == 'latest' && format('{0}:latest', env.DOCKER_IMAGE_NAME) || '' }}
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ needs.extract-version.outputs.VERSION }}
+            ${{ needs.extract-version.outputs.VERSION == 'latest' && format('{0}:latest', env.DOCKER_IMAGE_NAME) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Inspect pushed image manifest
+        run: |
+          docker buildx imagetools inspect ${{ env.DOCKER_IMAGE_NAME }}:${{ needs.extract-version.outputs.VERSION }}
