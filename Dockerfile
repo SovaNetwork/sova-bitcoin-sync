@@ -20,8 +20,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 RUN cargo build --release
 
-# Create the runtime image using Distroless (very minimal, more secure)
-FROM gcr.io/distroless/cc-debian12
+# Ubuntu base image
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y curl && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy the binary from builder
 COPY --from=builder /app/target/release/sova-bitcoin-sync /usr/local/bin/

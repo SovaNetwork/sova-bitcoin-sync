@@ -8,10 +8,10 @@ on:
   workflow_dispatch:
 
 env:
-  REPO_NAME: ${{ github.repository_owner }}/sova-sentinel
-  IMAGE_NAME: ${{ github.repository_owner }}/sova-sentinel
+  REPO_NAME: ${{ github.repository_owner }}/sova-bitcoin-sync
+  IMAGE_NAME: ${{ github.repository_owner }}/sova-bitcoin-sync
   CARGO_TERM_COLOR: always
-  DOCKER_IMAGE_NAME: ghcr.io/sovanetwork/sova-sentinel
+  DOCKER_IMAGE_NAME: ghcr.io/sovanetwork/sova-bitcoin-sync
   DOCKER_USERNAME: ${{ github.actor }}
 
 jobs:
