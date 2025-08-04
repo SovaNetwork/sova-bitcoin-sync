@@ -6,11 +6,14 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
+use async_trait::async_trait;
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use base64::Engine;
+use bitcoincore_rpc::{Auth, Client as CoreClient, RpcApi};
 use clap::Parser;
 use serde_json::{json, Value};
 use std::{
+    error::Error,
     str::FromStr,
     sync::{Arc, RwLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -77,6 +80,14 @@ struct Args {
     #[arg(long, default_value = "password")]
     btc_rpc_password: String,
 
+    /// RPC connection type (bitcoincore, external)
+    #[arg(
+        long,
+        default_value = "bitcoincore",
+        help = "RPC connection type (bitcoincore, external)"
+    )]
+    rpc_connection_type: String,
+
     /// Sova sequencer RPC URL
     #[arg(long, default_value = "http://sova-reth:8545")]
     sequencer_rpc_url: String,
@@ -102,16 +113,57 @@ struct Args {
     health_port: u16,
 }
 
-struct BitcoinRpc {
+impl Args {
+    fn parse_connection_type(&self) -> Result<String, String> {
+        match self.rpc_connection_type.to_lowercase().as_str() {
+            "bitcoincore" | "external" => Ok(self.rpc_connection_type.to_lowercase()),
+            other => Err(format!("Unsupported connection type: {other}")),
+        }
+    }
+}
+
+#[async_trait]
+trait BitcoinRpcClient: Send + Sync {
+    async fn get_block_count(&self) -> Result<u64, Box<dyn Error + Send + Sync>>;
+    async fn get_block_hash(&self, height: u64) -> Result<String, Box<dyn Error + Send + Sync>>;
+}
+
+struct BitcoinCoreRpcClient {
+    client: CoreClient,
+}
+
+impl BitcoinCoreRpcClient {
+    fn new(url: &str, user: &str, password: &str) -> Result<Self, bitcoincore_rpc::Error> {
+        let auth = if user.is_empty() && password.is_empty() {
+            Auth::None
+        } else {
+            Auth::UserPass(user.to_string(), password.to_string())
+        };
+        let client = CoreClient::new(url, auth)?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl BitcoinRpcClient for BitcoinCoreRpcClient {
+    async fn get_block_count(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        Ok(self.client.get_block_count()?)
+    }
+
+    async fn get_block_hash(&self, height: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
+        Ok(self.client.get_block_hash(height)?.to_string())
+    }
+}
+
+struct ExternalRpcClient {
     client: reqwest::Client,
     url: String,
     auth: String,
 }
 
-impl BitcoinRpc {
+impl ExternalRpcClient {
     fn new(url: String, user: String, password: String) -> Self {
-        let auth =
-            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password));
+        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
         Self {
             client: reqwest::Client::new(),
             url,
@@ -119,7 +171,11 @@ impl BitcoinRpc {
         }
     }
 
-    async fn get_block_count(&self) -> Result<u64, Box<dyn std::error::Error>> {
+    async fn call_rpc(
+        &self,
+        method: &str,
+        params: Vec<Value>,
+    ) -> Result<Value, Box<dyn Error + Send + Sync>> {
         let response = self
             .client
             .post(&self.url)
@@ -127,47 +183,40 @@ impl BitcoinRpc {
             .header("Content-Type", "application/json")
             .json(&json!({
                 "jsonrpc": "1.0",
-                "id": "getblockcount",
-                "method": "getblockcount",
-                "params": []
+                "id": method,
+                "method": method,
+                "params": params
             }))
             .send()
-            .await?;
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        let json: Value = response
+            .json()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(json)
+    }
+}
 
-        let json: Value = response.json().await?;
-        if let Some(result) = json["result"].as_u64() {
-            Ok(result)
-        } else {
-            Err(format!("Invalid response: {}", json).into())
-        }
+#[async_trait]
+impl BitcoinRpcClient for ExternalRpcClient {
+    async fn get_block_count(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        let json = self.call_rpc("getblockcount", Vec::new()).await?;
+        let result: u64 = serde_json::from_value(json["result"].clone())
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(result)
     }
 
-    async fn get_block_hash(&self, height: u64) -> Result<String, Box<dyn std::error::Error>> {
-        let response = self
-            .client
-            .post(&self.url)
-            .header("Authorization", format!("Basic {}", self.auth))
-            .header("Content-Type", "application/json")
-            .json(&json!({
-                "jsonrpc": "1.0",
-                "id": "getblockhash",
-                "method": "getblockhash",
-                "params": [height]
-            }))
-            .send()
-            .await?;
-
-        let json: Value = response.json().await?;
-        if let Some(result) = json["result"].as_str() {
-            Ok(result.to_string())
-        } else {
-            Err(format!("Invalid response: {}", json).into())
-        }
+    async fn get_block_hash(&self, height: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
+        let json = self.call_rpc("getblockhash", vec![json!(height)]).await?;
+        let result: String = serde_json::from_value(json["result"].clone())
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        Ok(result)
     }
 }
 
 struct AdminService {
-    bitcoin_rpc: BitcoinRpc,
+    bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
     sequencer_rpc_url: String,
     admin_private_key: String,
     contract_address: Address,
@@ -176,16 +225,29 @@ struct AdminService {
 }
 
 impl AdminService {
-    async fn new(args: &Args) -> Result<Self, Box<dyn std::error::Error>> {
-        // Initialize Bitcoin RPC client
-        let bitcoin_rpc = BitcoinRpc::new(
-            args.btc_rpc_url.clone(),
-            args.btc_rpc_user.clone(),
-            args.btc_rpc_password.clone(),
-        );
+    async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        let connection_type = args
+            .parse_connection_type()
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn Error + Send + Sync>)?;
+        let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
+            "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
+                &args.btc_rpc_url,
+                &args.btc_rpc_user,
+                &args.btc_rpc_password,
+            )?),
+            "external" => Arc::new(ExternalRpcClient::new(
+                args.btc_rpc_url.clone(),
+                args.btc_rpc_user.clone(),
+                args.btc_rpc_password.clone(),
+            )),
+            _ => unreachable!(),
+        };
 
         // Parse contract address
-        let contract_address: Address = args.contract_address.parse()?;
+        let contract_address: Address = args
+            .contract_address
+            .parse()
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok(Self {
             bitcoin_rpc,
@@ -197,7 +259,7 @@ impl AdminService {
         })
     }
 
-    async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn std::error::Error>> {
+    async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn Error + Send + Sync>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -217,25 +279,21 @@ impl AdminService {
                 // Update health status - Bitcoin RPC is unhealthy
                 if let Ok(mut status) = self.health_status.write() {
                     status.bitcoin_rpc_healthy = false;
-                    status.last_error = Some(format!("Bitcoin RPC error: {}", e));
+                    status.last_error = Some(format!("Bitcoin RPC error: {e}"));
                 }
                 return Err(e);
             }
         };
 
         // Calculate the height for the confirmation block
-        let target_height = if current_height >= self.confirmation_blocks {
-            current_height - self.confirmation_blocks
-        } else {
-            // If we don't have enough blocks yet, use block 0
-            0
-        };
+        let target_height = current_height.saturating_sub(self.confirmation_blocks);
 
         // Get the block hash at the target height
         let block_hash_str = self.bitcoin_rpc.get_block_hash(target_height).await?;
 
         // Convert hex string to B256
-        let block_hash = B256::from_str(&block_hash_str)?;
+        let block_hash = B256::from_str(&block_hash_str)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok((current_height, block_hash))
     }
@@ -244,7 +302,7 @@ impl AdminService {
         &self,
         block_height: u64,
         block_hash: B256,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!(
             "Updating contract with block height {} and hash 0x{}",
             block_height,
@@ -253,13 +311,17 @@ impl AdminService {
 
         // Parse private key and create signer
         let private_key = self.admin_private_key.trim_start_matches("0x");
-        let signer: PrivateKeySigner = private_key.parse()?;
+        let signer: PrivateKeySigner = private_key
+            .parse()
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         let wallet = EthereumWallet::from(signer);
 
         // Create provider with wallet
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(self.sequencer_rpc_url.parse()?);
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
+            self.sequencer_rpc_url
+                .parse()
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?,
+        );
 
         // Create contract instance
         let contract = SovaL1Block::new(self.contract_address, provider);
@@ -267,9 +329,13 @@ impl AdminService {
         let tx = contract
             .setBitcoinBlockData(block_height, block_hash)
             .send()
-            .await?;
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let receipt = tx.get_receipt().await?;
+        let receipt = tx
+            .get_receipt()
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         info!(
             "Transaction successful: 0x{} (block: {})",
@@ -315,7 +381,7 @@ impl AdminService {
                         // Update health status on contract update failure
                         if let Ok(mut status) = self.health_status.write() {
                             status.sequencer_rpc_healthy = false;
-                            status.last_error = Some(format!("Contract update error: {}", e));
+                            status.last_error = Some(format!("Contract update error: {e}"));
                         }
                     }
                 }
@@ -393,7 +459,7 @@ async fn liveness_check() -> Json<Value> {
 async fn start_health_server(
     health_status: Arc<RwLock<HealthStatus>>,
     port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
@@ -401,15 +467,19 @@ async fn start_health_server(
         .layer(ServiceBuilder::new())
         .with_state(health_status);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     info!("Health check server running on port {}", port);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 

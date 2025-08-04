@@ -39,6 +39,7 @@ cargo run -- \
   --btc-rpc-url "http://your-bitcoin-node:8332" \
   --btc-rpc-user "your_user" \
   --btc-rpc-password "your_password" \
+  --rpc-connection-type "bitcoincore" \
   --sequencer-rpc-url "http://your-sova-node:8545" \
   --contract-address "0x2100000000000000000000000000000000000015" \
   --update-interval 30
@@ -51,6 +52,7 @@ cargo run -- \
 | `--btc-rpc-url` | `http://bitcoin-regtest:18443` | Bitcoin RPC endpoint |
 | `--btc-rpc-user` | `user` | Bitcoin RPC username |
 | `--btc-rpc-password` | `password` | Bitcoin RPC password |
+| `--rpc-connection-type` | `bitcoincore` | RPC connection type (`bitcoincore` or `external`) |
 | `--sequencer-rpc-url` | `http://sova-reth:8545` | Sova sequencer RPC endpoint |
 | `--admin-private-key` | (env: `ADMIN_PRIVATE_KEY`) | Private key for contract updates |
 | `--contract-address` | `0x2100000000000000000000000000000000000015` | SovaL1Block contract address |
