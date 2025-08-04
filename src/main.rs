@@ -9,7 +9,7 @@ use alloy::{
 use async_trait::async_trait;
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use base64::Engine;
-use bitcoincore_rpc::{Auth, Client as CoreClient};
+use bitcoincore_rpc::{Auth, Client as CoreClient, RpcApi};
 use clap::Parser;
 use serde_json::{json, Value};
 use std::{
@@ -226,10 +226,10 @@ struct AdminService {
 }
 
 impl AdminService {
-    async fn new(args: &Args) -> Result<Self, Box<dyn Error>> {
+    async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
         let connection_type = args
             .parse_connection_type()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn Error + Send + Sync>)?;
         let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
             "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
                 &args.btc_rpc_url,
@@ -245,7 +245,8 @@ impl AdminService {
         };
 
         // Parse contract address
-        let contract_address: Address = args.contract_address.parse()?;
+        let contract_address: Address = args.contract_address.parse()
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok(Self {
             bitcoin_rpc,
@@ -257,7 +258,7 @@ impl AdminService {
         })
     }
 
-    async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn Error>> {
+    async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn Error + Send + Sync>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -295,7 +296,8 @@ impl AdminService {
         let block_hash_str = self.bitcoin_rpc.get_block_hash(target_height).await?;
 
         // Convert hex string to B256
-        let block_hash = B256::from_str(&block_hash_str)?;
+        let block_hash = B256::from_str(&block_hash_str)
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok((current_height, block_hash))
     }
@@ -304,7 +306,7 @@ impl AdminService {
         &self,
         block_height: u64,
         block_hash: B256,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
         info!(
             "Updating contract with block height {} and hash 0x{}",
             block_height,
@@ -313,13 +315,15 @@ impl AdminService {
 
         // Parse private key and create signer
         let private_key = self.admin_private_key.trim_start_matches("0x");
-        let signer: PrivateKeySigner = private_key.parse()?;
+        let signer: PrivateKeySigner = private_key.parse()
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         let wallet = EthereumWallet::from(signer);
 
         // Create provider with wallet
         let provider = ProviderBuilder::new()
             .wallet(wallet)
-            .connect_http(self.sequencer_rpc_url.parse()?);
+            .connect_http(self.sequencer_rpc_url.parse()
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?);
 
         // Create contract instance
         let contract = SovaL1Block::new(self.contract_address, provider);
@@ -327,9 +331,11 @@ impl AdminService {
         let tx = contract
             .setBitcoinBlockData(block_height, block_hash)
             .send()
-            .await?;
+            .await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let receipt = tx.get_receipt().await?;
+        let receipt = tx.get_receipt().await
+            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         info!(
             "Transaction successful: 0x{} (block: {})",
@@ -453,7 +459,7 @@ async fn liveness_check() -> Json<Value> {
 async fn start_health_server(
     health_status: Arc<RwLock<HealthStatus>>,
     port: u16,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let app = Router::new()
         .route("/health", get(health_check))
         .route("/ready", get(readiness_check))
@@ -461,15 +467,17 @@ async fn start_health_server(
         .layer(ServiceBuilder::new())
         .with_state(health_status);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     info!("Health check server running on port {}", port);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app).await
+        .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     Ok(())
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Initialize tracing
     tracing_subscriber::fmt::init();
 
