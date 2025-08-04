@@ -226,10 +226,9 @@ struct AdminService {
 
 impl AdminService {
     async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let connection_type = args.parse_connection_type().map_err(|e| {
-            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
-                as Box<dyn Error + Send + Sync>
-        })?;
+        let connection_type = args
+            .parse_connection_type()
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn Error + Send + Sync>)?;
         let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
             "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
                 &args.btc_rpc_url,
@@ -287,12 +286,7 @@ impl AdminService {
         };
 
         // Calculate the height for the confirmation block
-        let target_height = if current_height >= self.confirmation_blocks {
-            current_height - self.confirmation_blocks
-        } else {
-            // If we don't have enough blocks yet, use block 0
-            0
-        };
+        let target_height = current_height.saturating_sub(self.confirmation_blocks);
 
         // Get the block hash at the target height
         let block_hash_str = self.bitcoin_rpc.get_block_hash(target_height).await?;
