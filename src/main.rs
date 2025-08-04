@@ -117,7 +117,7 @@ impl Args {
     fn parse_connection_type(&self) -> Result<String, String> {
         match self.rpc_connection_type.to_lowercase().as_str() {
             "bitcoincore" | "external" => Ok(self.rpc_connection_type.to_lowercase()),
-            other => Err(format!("Unsupported connection type: {}", other)),
+            other => Err(format!("Unsupported connection type: {other}")),
         }
     }
 }
@@ -163,8 +163,7 @@ struct ExternalRpcClient {
 
 impl ExternalRpcClient {
     fn new(url: String, user: String, password: String) -> Self {
-        let auth =
-            base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", user, password));
+        let auth = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
         Self {
             client: reqwest::Client::new(),
             url,
@@ -281,7 +280,7 @@ impl AdminService {
                 // Update health status - Bitcoin RPC is unhealthy
                 if let Ok(mut status) = self.health_status.write() {
                     status.bitcoin_rpc_healthy = false;
-                    status.last_error = Some(format!("Bitcoin RPC error: {}", e));
+                    status.last_error = Some(format!("Bitcoin RPC error: {e}"));
                 }
                 return Err(e);
             }
@@ -388,7 +387,7 @@ impl AdminService {
                         // Update health status on contract update failure
                         if let Ok(mut status) = self.health_status.write() {
                             status.sequencer_rpc_healthy = false;
-                            status.last_error = Some(format!("Contract update error: {}", e));
+                            status.last_error = Some(format!("Contract update error: {e}"));
                         }
                     }
                 }
@@ -474,7 +473,7 @@ async fn start_health_server(
         .layer(ServiceBuilder::new())
         .with_state(health_status);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+    let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
         .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     info!("Health check server running on port {}", port);
