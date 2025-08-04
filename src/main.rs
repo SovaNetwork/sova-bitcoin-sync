@@ -227,9 +227,10 @@ struct AdminService {
 
 impl AdminService {
     async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let connection_type = args
-            .parse_connection_type()
-            .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e)) as Box<dyn Error + Send + Sync>)?;
+        let connection_type = args.parse_connection_type().map_err(|e| {
+            Box::new(std::io::Error::new(std::io::ErrorKind::Other, e))
+                as Box<dyn Error + Send + Sync>
+        })?;
         let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
             "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
                 &args.btc_rpc_url,
@@ -245,7 +246,9 @@ impl AdminService {
         };
 
         // Parse contract address
-        let contract_address: Address = args.contract_address.parse()
+        let contract_address: Address = args
+            .contract_address
+            .parse()
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         Ok(Self {
@@ -315,15 +318,17 @@ impl AdminService {
 
         // Parse private key and create signer
         let private_key = self.admin_private_key.trim_start_matches("0x");
-        let signer: PrivateKeySigner = private_key.parse()
+        let signer: PrivateKeySigner = private_key
+            .parse()
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         let wallet = EthereumWallet::from(signer);
 
         // Create provider with wallet
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(self.sequencer_rpc_url.parse()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?);
+        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
+            self.sequencer_rpc_url
+                .parse()
+                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?,
+        );
 
         // Create contract instance
         let contract = SovaL1Block::new(self.contract_address, provider);
@@ -334,7 +339,9 @@ impl AdminService {
             .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        let receipt = tx.get_receipt().await
+        let receipt = tx
+            .get_receipt()
+            .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
         info!(
@@ -467,11 +474,13 @@ async fn start_health_server(
         .layer(ServiceBuilder::new())
         .with_state(health_status);
 
-    let listener = TcpListener::bind(format!("0.0.0.0:{}", port)).await
+    let listener = TcpListener::bind(format!("0.0.0.0:{}", port))
+        .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     info!("Health check server running on port {}", port);
 
-    axum::serve(listener, app).await
+    axum::serve(listener, app)
+        .await
         .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
     Ok(())
 }
