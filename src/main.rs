@@ -13,7 +13,10 @@ use serde_json::{json, Value};
 use std::{
     error::Error,
     str::FromStr,
-    sync::{Arc, RwLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, RwLock,
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -161,6 +164,7 @@ struct ExternalRpcClient {
     url: String,
     user: Option<String>,
     password: Option<String>,
+    request_id: AtomicU64,
 }
 
 impl ExternalRpcClient {
@@ -176,6 +180,7 @@ impl ExternalRpcClient {
             url,
             user,
             password,
+            request_id: AtomicU64::new(0),
         }
     }
 
@@ -184,12 +189,13 @@ impl ExternalRpcClient {
         method: &str,
         params: Vec<Value>,
     ) -> Result<Value, Box<dyn Error + Send + Sync>> {
+        let id = self.request_id.fetch_add(1, Ordering::SeqCst);
         let mut req = self
             .client
             .post(&self.url)
             .json(&json!({
-                "jsonrpc": "1.0",
-                "id": "1",
+                "jsonrpc": "2.0",
+                "id": id,
                 "method": method,
                 "params": params
             }))
