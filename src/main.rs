@@ -246,10 +246,9 @@ struct AdminService {
 
 impl AdminService {
     async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let connection_type = args.parse_connection_type().map_err(|e| {
-            Box::new(std::io::Error::other(e))
-                as Box<dyn Error + Send + Sync>
-        })?;
+        let connection_type = args
+            .parse_connection_type()
+            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn Error + Send + Sync>)?;
         let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
             "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
                 &args.btc_rpc_url,
