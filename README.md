@@ -60,7 +60,9 @@ cargo run -- \
   --update-interval 30 \
   --confirmation-blocks 6 \
   --health-port 8080 \
-  --rbf-timeout-seconds 60
+  --rbf-timeout-seconds 60 \
+  --min-tip-gwei 2 \
+  --max-fee-cap-gwei 150
 ```
 
 ## Configuration
@@ -78,10 +80,16 @@ cargo run -- \
 | `--confirmation-blocks` | `6` | Number of confirmation blocks |
 | `--health-port` | `8080` | Health check server port |
 | `--rbf-timeout-seconds` | `60` | Pending window before attempting RBF |
+| `--min-tip-gwei` | `1` | Minimum tip in gwei for gas calculations |
+| `--max-fee-cap-gwei` | `200` | Maximum fee cap in gwei for gas calculations |
 
-## In-code gas constants
-- MIN_TIP = 1 gwei
-- MAX_FEE_CAP = 200 gwei
+## Gas Configuration
+
+### Runtime-Configurable Parameters (CLI flags)
+- **--min-tip-gwei** = 1 gwei (default, configurable via CLI)
+- **--max-fee-cap-gwei** = 200 gwei (default, configurable via CLI)
+
+### Fixed Constants
 - DEFAULT_BASE_FEE = 1 gwei (fallback)
 - BUMP_MULTIPLIER = 15% per RBF attempt
 - MAX_RBF_ATTEMPTS = 8
