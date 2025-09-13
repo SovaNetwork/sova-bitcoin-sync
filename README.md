@@ -1,6 +1,6 @@
 # Sova Bitcoin Sync Service
 
-A service that synchronizes Bitcoin blockchain data to the Sova L1 smart contract. It fetches the latest Bitcoin block information and updates the `SovaL1Block` contract with block height and hash data.
+A service that synchronizes Bitcoin blockchain data to the Sova L2 `SovaL1Block` smart contract. It fetches the latest Bitcoin block information and updates the `SovaL1Block` contract with block height and hash data.
 
 ## Features
 
