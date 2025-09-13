@@ -398,37 +398,63 @@ where
         rbf_count: u32,
         last_tip: Option<u128>,
     ) -> (u128, u128) {
+        // Get suggested values with sane fallbacks
         let (suggested_tip, base_fee) = Self::suggest_tip_and_basefee_with(provider)
             .await
             .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
 
-        // Strictly increasing priority fee
-        let mut tip = last_tip
-            .map(|t| t.saturating_mul(100 + BUMP_MULTIPLIER as u128) / 100)
-            .unwrap_or(suggested_tip)
-            .max(MIN_TIP);
+        // Base tip to start from (use last_tip if we have it, else the suggestion)
+        let base_tip = last_tip.unwrap_or(suggested_tip).max(MIN_TIP);
 
-        // Cap tip
-        tip = tip.min(MAX_FEE_CAP);
+        // Compute compound bump factors for this attempt count
+        let bump_per = 100u128 + (BUMP_MULTIPLIER as u128);
+        let r = rbf_count.min(MAX_RBF_ATTEMPTS); // clamp just in case
+        let num = bump_per.saturating_pow(r);
+        let den = 100u128.saturating_pow(r);
 
-        // Ensure headroom above base fee, and bump with attempts
+        // Bumped tip (compounded). Guard and cap.
+        let mut tip = base_tip
+            .saturating_mul(num)
+            .checked_div(den)
+            .unwrap_or(base_tip)
+            .clamp(MIN_TIP, MAX_FEE_CAP);
+
+        // Compute a bumped max_fee from (base_fee + tip), then apply invariants & cap.
         let mut max_fee = base_fee
             .saturating_add(tip)
-            .saturating_mul(100 + (BUMP_MULTIPLIER as u128 * rbf_count as u128))
-            / 100;
+            .saturating_mul(num)
+            .checked_div(den)
+            .unwrap_or_else(|| base_fee.saturating_add(tip));
 
-        // Invariants and cap: enforce max_fee >= base_fee + tip at calculation time
-        max_fee = max_fee.max(base_fee.saturating_add(tip) + 1);
-        if max_fee <= tip {
-            max_fee = tip + 1;
+        // Enforce invariants
+        let min_required = base_fee.saturating_add(tip).saturating_add(1);
+        if max_fee < min_required {
+            max_fee = min_required;
         }
-        max_fee = max_fee.min(MAX_FEE_CAP);
+        if max_fee <= tip {
+            max_fee = tip.saturating_add(1);
+        }
+        if max_fee > MAX_FEE_CAP {
+            max_fee = MAX_FEE_CAP;
+            // Ensure tip never exceeds (capped) max_fee - base_fee - 1
+            let max_allowed_tip = max_fee.saturating_sub(base_fee).saturating_sub(1);
+            if tip > max_allowed_tip {
+                tip = max_allowed_tip.max(MIN_TIP);
+            }
+        }
+
+        // Pretty logging with decimals so sub-gwei bumps are visible
+        let gwei = |v: u128| {
+            let v_f = (v as f64) / 1_000_000_000f64;
+            format!("{v_f:.3}")
+        };
 
         info!(
-            "Gas calculation: base_fee={} gwei, tip={} gwei, max_fee={} gwei (RBF: {rbf_count})",
-            base_fee / 1_000_000_000,
-            tip / 1_000_000_000,
-            max_fee / 1_000_000_000
+            "Gas calculation: base_fee={} gwei, tip={} gwei, max_fee={} gwei (RBF: {})",
+            gwei(base_fee),
+            gwei(tip),
+            gwei(max_fee),
+            rbf_count
         );
 
         (max_fee, tip)
