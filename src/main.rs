@@ -31,10 +31,15 @@ use tracing::{debug, info, warn};
 
 // Gas management constants
 const MAX_RBF_ATTEMPTS: u32 = 8;
-const MIN_TIP: u128 = 1_000_000_000; // 1 gwei
-const MAX_FEE_CAP: u128 = 200_000_000_000; // 200 gwei
 const DEFAULT_BASE_FEE: u128 = 1_000_000_000; // 1 gwei fallback
 const BUMP_MULTIPLIER: u32 = 15; // 15% increase per RBF
+
+// Runtime gas configuration
+#[derive(Debug, Clone)]
+struct GasCfg {
+    min_tip: u128,
+    max_fee_cap: u128,
+}
 
 // SovaL1Block contract interface
 sol! {
@@ -147,6 +152,14 @@ struct Args {
     /// RBF timeout in seconds
     #[arg(long, default_value = "60")]
     rbf_timeout_seconds: u64,
+
+    /// Minimum tip in gwei (floor for maxPriorityFeePerGas)
+    #[arg(long, default_value = "1")]
+    min_tip_gwei: u128,
+
+    /// Maximum maxFeePerGas cap in gwei (ceiling for fees)
+    #[arg(long, default_value = "200")]
+    max_fee_cap_gwei: u128,
 }
 
 impl Args {
@@ -299,6 +312,7 @@ where
     in_flight_tx: Arc<RwLock<Option<InFlightTransaction>>>,
     provider: P,
     contract: SovaL1Block::SovaL1BlockInstance<P>,
+    gas: GasCfg,
 }
 
 impl<P> SyncService<P>
@@ -309,6 +323,7 @@ where
         args: &Args,
         bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
         provider: P,
+        gas_cfg: GasCfg,
     ) -> Result<Self, Box<dyn Error + Send + Sync>> {
         // Parse contract address once
         let contract_address: Address = args.contract_address.parse()?;
@@ -323,11 +338,13 @@ where
             in_flight_tx: Arc::new(RwLock::new(None)),
             provider,
             contract,
+            gas: gas_cfg,
         })
     }
 
     async fn suggest_tip_and_basefee_with<T: Provider>(
         provider: &T,
+        gas_cfg: &GasCfg,
     ) -> Result<(u128, u128), Box<dyn Error + Send + Sync>> {
         // 1) Try feeHistory for last 5 blocks, 50th percentile
         if let Ok(hist) = provider
@@ -343,7 +360,7 @@ where
             let base = match base_fees.last() {
                 Some(v) => {
                     let u256_val = U256::from(*v);
-                    u256_val.to::<u128>().min(MAX_FEE_CAP)
+                    u256_val.to::<u128>().min(gas_cfg.max_fee_cap)
                 }
                 None => DEFAULT_BASE_FEE,
             };
@@ -351,30 +368,43 @@ where
             // reward is Vec<Vec<u128 or U256>>; use last reward's 50th percentile
             if let Some(rew) = hist.reward.as_ref().and_then(|r| r.last()) {
                 if let Some(mid) = rew.first() {
-                    // Cast robustly
+                    // Cast robustly and apply floor policy
                     let u256_tip = U256::from(*mid);
-                    let tip = u256_tip.to::<u128>().clamp(MIN_TIP, MAX_FEE_CAP);
-                    debug!(
-                        "Fee history: base={} gwei, tip={} gwei",
-                        base / 1_000_000_000,
+                    let p50_tip = u256_tip.to::<u128>();
+                    let mpg = provider
+                        .get_max_priority_fee_per_gas()
+                        .await
+                        .ok()
+                        .map(|v| U256::from(v).to::<u128>())
+                        .unwrap_or(0);
+
+                    // Compute effective tip = max(p50, maxPriority, min_tip)
+                    let tip = std::cmp::max(std::cmp::max(p50_tip, mpg), gas_cfg.min_tip)
+                        .min(gas_cfg.max_fee_cap);
+
+                    info!(
+                        "Tip sources: p50={} gwei, maxPriority={} gwei, floor={} gwei -> chosen={} gwei",
+                        p50_tip / 1_000_000_000,
+                        mpg / 1_000_000_000,
+                        gas_cfg.min_tip / 1_000_000_000,
                         tip / 1_000_000_000
                     );
                     return Ok((tip, base));
                 }
             }
-            return Ok((MIN_TIP, base));
+            return Ok((gas_cfg.min_tip, base));
         }
 
         // 2) Fallback to maxPriorityFeePerGas + pending.baseFee
-        let tip_fallback = provider
+        let mpg = provider
             .get_max_priority_fee_per_gas()
             .await
             .ok()
-            .map(|v| {
-                let u256_val = U256::from(v);
-                u256_val.to::<u128>().clamp(MIN_TIP, MAX_FEE_CAP)
-            })
-            .unwrap_or(MIN_TIP);
+            .map(|v| U256::from(v).to::<u128>())
+            .unwrap_or(0);
+
+        // Apply floor policy: max(maxPriority, min_tip)
+        let tip_fallback = std::cmp::max(mpg, gas_cfg.min_tip).min(gas_cfg.max_fee_cap);
 
         let base = provider
             .get_block_by_number(BlockNumberOrTag::Pending)
@@ -382,12 +412,17 @@ where
             .ok()
             .flatten()
             .and_then(|b| b.header.base_fee_per_gas)
-            .map(|v| (v as u128).min(MAX_FEE_CAP))
+            .map(|v| {
+                // works whether v is U256-like or primitive via Into<U256>
+                let u = U256::from(v);
+                u.to::<u128>().min(gas_cfg.max_fee_cap)
+            })
             .unwrap_or(DEFAULT_BASE_FEE);
 
-        debug!(
-            "Fee fallback: base={} gwei, tip={} gwei",
-            base / 1_000_000_000,
+        info!(
+            "Tip sources: p50=0 gwei, maxPriority={} gwei, floor={} gwei -> chosen={} gwei",
+            mpg / 1_000_000_000,
+            gas_cfg.min_tip / 1_000_000_000,
             tip_fallback / 1_000_000_000
         );
         Ok((tip_fallback, base))
@@ -395,16 +430,17 @@ where
 
     async fn calculate_gas_fees_with<T: Provider>(
         provider: &T,
+        gas_cfg: &GasCfg,
         rbf_count: u32,
         last_tip: Option<u128>,
     ) -> (u128, u128) {
         // Get suggested values with sane fallbacks
-        let (suggested_tip, base_fee) = Self::suggest_tip_and_basefee_with(provider)
+        let (suggested_tip, base_fee) = Self::suggest_tip_and_basefee_with(provider, gas_cfg)
             .await
-            .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+            .unwrap_or((gas_cfg.min_tip, DEFAULT_BASE_FEE));
 
         // Base tip to start from (use last_tip if we have it, else the suggestion)
-        let base_tip = last_tip.unwrap_or(suggested_tip).max(MIN_TIP);
+        let base_tip = last_tip.unwrap_or(suggested_tip).max(gas_cfg.min_tip);
 
         // Compute compound bump factors for this attempt count
         let bump_per = 100u128 + (BUMP_MULTIPLIER as u128);
@@ -417,7 +453,7 @@ where
             .saturating_mul(num)
             .checked_div(den)
             .unwrap_or(base_tip)
-            .clamp(MIN_TIP, MAX_FEE_CAP);
+            .clamp(gas_cfg.min_tip, gas_cfg.max_fee_cap);
 
         // Compute a bumped max_fee from (base_fee + tip), then apply invariants & cap.
         let mut max_fee = base_fee
@@ -425,6 +461,22 @@ where
             .saturating_mul(num)
             .checked_div(den)
             .unwrap_or_else(|| base_fee.saturating_add(tip));
+
+        // Early sanity clamp in calculate_gas_fees_with (belt & suspenders)
+        if gas_cfg.max_fee_cap <= base_fee {
+            // cap cannot cover base fee; force a small headroom above base so tx is valid
+            let needed = base_fee.saturating_add(1);
+            // pick the largest tip we can under the cap
+            tip = tip
+                .min(
+                    gas_cfg
+                        .max_fee_cap
+                        .saturating_sub(base_fee)
+                        .saturating_sub(1),
+                )
+                .max(gas_cfg.min_tip);
+            max_fee = needed.saturating_add(tip);
+        }
 
         // Enforce invariants
         let min_required = base_fee.saturating_add(tip).saturating_add(1);
@@ -434,12 +486,12 @@ where
         if max_fee <= tip {
             max_fee = tip.saturating_add(1);
         }
-        if max_fee > MAX_FEE_CAP {
-            max_fee = MAX_FEE_CAP;
+        if max_fee > gas_cfg.max_fee_cap {
+            max_fee = gas_cfg.max_fee_cap;
             // Ensure tip never exceeds (capped) max_fee - base_fee - 1
             let max_allowed_tip = max_fee.saturating_sub(base_fee).saturating_sub(1);
             if tip > max_allowed_tip {
-                tip = max_allowed_tip.max(MIN_TIP);
+                tip = max_allowed_tip.max(gas_cfg.min_tip);
             }
         }
 
@@ -653,13 +705,18 @@ where
 
         loop {
             // Calculate gas fees with Reth's fee history API using stored provider
-            let (mut max_fee, tip) =
-                Self::calculate_gas_fees_with(&self.provider, current_rbf_count, last_tip).await;
+            let (mut max_fee, tip) = Self::calculate_gas_fees_with(
+                &self.provider,
+                &self.gas,
+                current_rbf_count,
+                last_tip,
+            )
+            .await;
 
             // Enforce base_fee + tip at send time (base fee can move)
-            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider)
+            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider, &self.gas)
                 .await
-                .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+                .unwrap_or((self.gas.min_tip, DEFAULT_BASE_FEE));
             if max_fee <= base_fee_now.saturating_add(tip) {
                 max_fee = base_fee_now.saturating_add(tip) + 1;
                 info!(
@@ -696,10 +753,11 @@ where
                     }
 
                     // Update metrics with fee information
-                    let observed_base = Self::suggest_tip_and_basefee_with(&self.provider)
-                        .await
-                        .ok()
-                        .map(|(_, base)| base);
+                    let observed_base =
+                        Self::suggest_tip_and_basefee_with(&self.provider, &self.gas)
+                            .await
+                            .ok()
+                            .map(|(_, base)| base);
                     if let Ok(mut status) = self.health_status.write() {
                         status.nonce_metrics.in_flight_count = 1;
                         status.nonce_metrics.last_submitted_height = Some(confirmed_height);
@@ -818,12 +876,12 @@ where
         loop {
             // Calculate gas fees with Reth's fee history API using stored provider
             let (mut max_fee, tip) =
-                Self::calculate_gas_fees_with(&self.provider, rbf_count, None).await;
+                Self::calculate_gas_fees_with(&self.provider, &self.gas, rbf_count, None).await;
 
             // Enforce base_fee + tip at send time (base fee can move)
-            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider)
+            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider, &self.gas)
                 .await
-                .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+                .unwrap_or((self.gas.min_tip, DEFAULT_BASE_FEE));
             if max_fee <= base_fee_now.saturating_add(tip) {
                 max_fee = base_fee_now.saturating_add(tip) + 1;
                 info!(
@@ -860,10 +918,11 @@ where
                     }
 
                     // Update metrics with fee information
-                    let observed_base = Self::suggest_tip_and_basefee_with(&self.provider)
-                        .await
-                        .ok()
-                        .map(|(_, base)| base);
+                    let observed_base =
+                        Self::suggest_tip_and_basefee_with(&self.provider, &self.gas)
+                            .await
+                            .ok()
+                            .map(|(_, base)| base);
                     if let Ok(mut status) = self.health_status.write() {
                         status.nonce_metrics.in_flight_count = 1;
                         status.nonce_metrics.last_submitted_height = Some(confirmed_height);
@@ -1082,6 +1141,7 @@ where
 async fn handle_health_request(
     path: &str,
     health_status: Arc<RwLock<HealthStatus>>,
+    gas_cfg: &GasCfg,
 ) -> (u16, String) {
     match path {
         "/health" => match health_status.read() {
@@ -1120,6 +1180,10 @@ async fn handle_health_request(
                         "last_max_fee_per_gas_gwei": status.nonce_metrics.last_max_fee_per_gas.map(|v| (v / 1_000_000_000).to_string()),
                         "last_priority_fee_per_gas_gwei": status.nonce_metrics.last_priority_fee_per_gas.map(|v| (v / 1_000_000_000).to_string()),
                         "observed_base_fee_gwei": status.nonce_metrics.observed_base_fee.map(|v| (v / 1_000_000_000).to_string())
+                    },
+                    "gas_policy": {
+                        "min_tip_gwei": (gas_cfg.min_tip / 1_000_000_000).to_string(),
+                        "max_fee_cap_gwei": (gas_cfg.max_fee_cap / 1_000_000_000).to_string()
                     }
                 });
 
@@ -1150,6 +1214,7 @@ async fn handle_health_request(
 async fn handle_connection(
     mut stream: TcpStream,
     health_status: Arc<RwLock<HealthStatus>>,
+    gas_cfg: &GasCfg,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buffer = [0; 1024];
     let n = stream.read(&mut buffer).await?;
@@ -1161,7 +1226,7 @@ async fn handle_connection(
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
-    let (status_code, body) = handle_health_request(path, health_status).await;
+    let (status_code, body) = handle_health_request(path, health_status, gas_cfg).await;
 
     let status_text = match status_code {
         200 => "OK",
@@ -1188,6 +1253,7 @@ async fn handle_connection(
 
 async fn start_health_server(
     health_status: Arc<RwLock<HealthStatus>>,
+    gas_cfg: GasCfg,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -1196,9 +1262,10 @@ async fn start_health_server(
     loop {
         let (stream, _) = listener.accept().await?;
         let health_status_clone = health_status.clone();
+        let gas_cfg_clone = gas_cfg.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, health_status_clone).await {
+            if let Err(e) = handle_connection(stream, health_status_clone, &gas_cfg_clone).await {
                 warn!("Error handling health check connection: {}", e);
             }
         });
@@ -1206,9 +1273,33 @@ async fn start_health_server(
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
+
+    // Validate CLI flags
+    if args.min_tip_gwei == 0 {
+        anyhow::bail!("--min-tip-gwei must be > 0");
+    }
+    if args.min_tip_gwei > args.max_fee_cap_gwei {
+        anyhow::bail!(
+            "--min-tip-gwei ({}) cannot exceed --max-fee-cap-gwei ({})",
+            args.min_tip_gwei,
+            args.max_fee_cap_gwei
+        );
+    }
+
+    // Runtime-configured gas floors/caps from CLI args
+    let gas_cfg = GasCfg {
+        min_tip: args.min_tip_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
+        max_fee_cap: args.max_fee_cap_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
+    };
+
+    info!(
+        "Gas policy: MIN_TIP={} gwei, MAX_FEE_CAP={} gwei",
+        gas_cfg.min_tip / 1_000_000_000,
+        gas_cfg.max_fee_cap / 1_000_000_000
+    );
 
     // Bitcoin RPC selection (unchanged)
     let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match args
@@ -1239,7 +1330,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .connect_http(url);
 
     // Type of `provider` is concrete and satisfies the bounds.
-    let service = SyncService::new_with(&args, bitcoin_rpc, provider).await?;
+    let service = SyncService::new_with(&args, bitcoin_rpc, provider, gas_cfg.clone())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create sync service: {}", e))?;
 
     // rest unchanged...
     let update_interval = Duration::from_secs(args.update_interval);
@@ -1253,7 +1346,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     tokio::select! {
         _ = service.run(update_interval) => warn!("Sync service exited unexpectedly"),
-        result = start_health_server(health_status, health_port) => {
+        result = start_health_server(health_status, gas_cfg.clone(), health_port) => {
             if let Err(e) = result { warn!("Health server failed: {e}"); }
         }
     }
