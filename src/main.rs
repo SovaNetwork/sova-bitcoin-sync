@@ -7,6 +7,7 @@ use alloy::{
     signers::local::PrivateKeySigner,
     sol,
 };
+use anyhow::{anyhow, bail, Result as AnyResult};
 use async_trait::async_trait;
 use backoff::{backoff::Backoff, ExponentialBackoff};
 use bitcoincore_rpc::{Auth, Client as CoreClient, RpcApi};
@@ -34,6 +35,9 @@ const MAX_RBF_ATTEMPTS: u32 = 8;
 const DEFAULT_BASE_FEE: u128 = 1_000_000_000; // 1 gwei fallback
 const BUMP_MULTIPLIER: u32 = 15; // 15% increase per RBF
 
+// Processed blocks pruning
+const KEEP_WINDOW: u64 = 10_000; // Keep last 10k blocks to prevent unbounded growth
+
 // Runtime gas configuration
 #[derive(Debug, Clone)]
 struct GasCfg {
@@ -56,6 +60,8 @@ struct NonceMetrics {
     pub nonce_latest: u64,
     pub nonce_pending: u64,
     pub in_flight_count: u32,
+    pub in_flight_nonce: Option<u64>,
+    pub waiting_rbf: bool,
     pub last_submitted_height: Option<u64>,
     pub last_submitted_hash: Option<String>,
     pub last_mined_height: Option<u64>,
@@ -382,12 +388,13 @@ where
                     let tip = std::cmp::max(std::cmp::max(p50_tip, mpg), gas_cfg.min_tip)
                         .min(gas_cfg.max_fee_cap);
 
+                    let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
                     info!(
                         "Tip sources: p50={} gwei, maxPriority={} gwei, floor={} gwei -> chosen={} gwei",
-                        p50_tip / 1_000_000_000,
-                        mpg / 1_000_000_000,
-                        gas_cfg.min_tip / 1_000_000_000,
-                        tip / 1_000_000_000
+                        gwei(p50_tip),
+                        gwei(mpg),
+                        gwei(gas_cfg.min_tip),
+                        gwei(tip)
                     );
                     return Ok((tip, base));
                 }
@@ -419,11 +426,12 @@ where
             })
             .unwrap_or(DEFAULT_BASE_FEE);
 
+        let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
         info!(
             "Tip sources: p50=0 gwei, maxPriority={} gwei, floor={} gwei -> chosen={} gwei",
-            mpg / 1_000_000_000,
-            gas_cfg.min_tip / 1_000_000_000,
-            tip_fallback / 1_000_000_000
+            gwei(mpg),
+            gwei(gas_cfg.min_tip),
+            gwei(tip_fallback)
         );
         Ok((tip_fallback, base))
     }
@@ -575,32 +583,63 @@ where
         Ok((current_height, confirmed_height, block_hash))
     }
 
-    async fn get_pending_nonce(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let mut backoff = ExponentialBackoff::default();
+    async fn get_nonces(&self) -> AnyResult<(u64, u64)> {
+        let from = self.provider.default_signer_address();
+        let latest = self.provider.get_transaction_count(from).latest().await?;
+        let pending = self.provider.get_transaction_count(from).pending().await?;
+        Ok((latest, pending))
+    }
+
+    async fn tx_known_for_nonce(&self, from: Address, nonce: u64) -> AnyResult<bool> {
+        // Prefer {:#x} for 0x-lowerhex
+        let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
+
+        // Try client() method first as it's most commonly available
+        let v: serde_json::Value = self
+            .provider
+            .client()
+            .request("eth_getTransactionBySenderAndNonce", params)
+            .await?;
+
+        Ok(!v.is_null())
+    }
+
+    async fn tx_hash_by_sender_and_nonce<T: Provider>(
+        provider: &T,
+        from: Address,
+        nonce: u64,
+    ) -> AnyResult<Option<B256>> {
+        let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
+        let v: serde_json::Value = provider
+            .client()
+            .request("eth_getTransactionBySenderAndNonce", params)
+            .await?;
+        let h = v
+            .get("hash")
+            .and_then(|x| x.as_str())
+            .and_then(|s| B256::from_str(s).ok());
+        Ok(h)
+    }
+
+    async fn reconcile_nonces_on_start(&self) -> AnyResult<()> {
+        let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
 
-        loop {
-            match self.provider.get_transaction_count(from).pending().await {
-                Ok(nonce) => {
-                    if let Ok(mut status) = self.health_status.write() {
-                        status.nonce_metrics.nonce_pending = nonce;
-                    }
-                    return Ok(nonce);
-                }
-                Err(e) => {
-                    warn!("Failed to get pending nonce: {e}");
-                    if let Ok(mut status) = self.health_status.write() {
-                        status.last_error = Some(format!("Nonce fetch error: {e}"));
-                    }
+        info!(%from, latest, pending, "Nonce reconciliation");
 
-                    if let Some(delay) = backoff.next_backoff() {
-                        time::sleep(delay).await;
-                    } else {
-                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
-                    }
-                }
-            }
+        // Conservative check: if pending - latest > 1, we have multiple gaps
+        // This is safer than trying to scan individual transactions
+        if pending.saturating_sub(latest) > 1 {
+            let err = format!(
+                "Multiple nonce gaps detected: latest={}, pending={}, gap_size={}. Refusing to send to avoid flooding txpool.",
+                latest, pending, pending.saturating_sub(latest)
+            );
+            warn!(%from, latest, pending, "Multiple nonce gaps detected; refusing to send");
+            return Err(anyhow!(err));
         }
+
+        info!(%from, "Nonce reconciliation passed");
+        Ok(())
     }
 
     async fn refresh_nonce_metrics(&self) {
@@ -624,7 +663,11 @@ where
         &self,
         tx_hash: B256,
     ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let mut backoff = ExponentialBackoff::default();
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(15),
+            max_elapsed_time: Some(Duration::from_secs(90)),
+            ..ExponentialBackoff::default()
+        };
 
         loop {
             match self.provider.get_transaction_receipt(tx_hash).await {
@@ -667,6 +710,12 @@ where
         }
     }
 
+    fn prune_processed(&self, min_height: u64) {
+        if let Ok(mut set) = self.processed_blocks.write() {
+            set.retain(|u| u.confirmed_height >= min_height.saturating_sub(KEEP_WINDOW));
+        }
+    }
+
     async fn update_contract_with_rbf(
         &self,
         confirmed_height: u64,
@@ -683,6 +732,26 @@ where
         // Deduplicate by BTC state
         if self.is_already_processed(&block_update) {
             info!("Contract update not necessary, BTC block update already processed: confirmed_height={confirmed_height}, hash=0x{}", hex::encode(block_hash));
+            return Ok(());
+        }
+
+        // Validate nonce before sending
+        let (latest, _) = self.get_nonces().await?;
+        let is_valid_nonce = nonce == latest || {
+            if let Ok(in_flight) = self.in_flight_tx.read() {
+                if let Some(ref tx) = *in_flight {
+                    nonce == tx.nonce
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+
+        if !is_valid_nonce {
+            let from = self.provider.default_signer_address();
+            warn!(%from, latest, nonce, "Invalid nonce for RBF; refusing to send");
             return Ok(());
         }
 
@@ -719,9 +788,10 @@ where
                 .unwrap_or((self.gas.min_tip, DEFAULT_BASE_FEE));
             if max_fee <= base_fee_now.saturating_add(tip) {
                 max_fee = base_fee_now.saturating_add(tip) + 1;
+                let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
                 info!(
                     "Adjusted max_fee to {} gwei for current base fee",
-                    max_fee / 1_000_000_000
+                    gwei(max_fee)
                 );
             }
 
@@ -760,6 +830,8 @@ where
                             .map(|(_, base)| base);
                     if let Ok(mut status) = self.health_status.write() {
                         status.nonce_metrics.in_flight_count = 1;
+                        status.nonce_metrics.in_flight_nonce = Some(nonce);
+                        status.nonce_metrics.waiting_rbf = false;
                         status.nonce_metrics.last_submitted_height = Some(confirmed_height);
                         status.nonce_metrics.last_submitted_hash =
                             Some(format!("0x{}", hex::encode(block_hash)));
@@ -796,14 +868,21 @@ where
 
                     if Self::is_known_transaction_error(&err_str) {
                         info!("Transaction already known, keeping polling state");
-                        // Keep polling - set in-flight placeholder to continue monitoring
+
+                        let from = self.provider.default_signer_address();
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
+                        let resolved =
+                            Self::tx_hash_by_sender_and_nonce(&self.provider, from, nonce)
+                                .await
+                                .ok()
+                                .flatten();
+
                         if let Ok(mut slot) = self.in_flight_tx.write() {
                             *slot = Some(InFlightTransaction {
-                                tx_hash: B256::ZERO, // unknown hash, but keep the nonce/block_update
+                                tx_hash: resolved.unwrap_or(B256::ZERO), // keep placeholder if still unknown
                                 nonce,
                                 block_update: block_update.clone(),
                                 submitted_at: now,
@@ -863,14 +942,39 @@ where
             }
         }
 
-        let pending_nonce = self.get_pending_nonce().await?;
+        let (latest, pending) = self.get_nonces().await?;
+        let nonce_to_use = latest;
+
+        // Assert nonce state is valid
+        if pending != latest && pending != latest + 1 {
+            let from = self.provider.default_signer_address();
+            warn!(
+                %from, latest, pending,
+                "Invalid nonce state; refusing to send"
+            );
+            return Ok(());
+        }
+
+        if pending == latest + 1 {
+            // Check if there's a transaction at the latest nonce (which should be the pending one)
+            let from = self.provider.default_signer_address();
+            let has_tx_latest = self.tx_known_for_nonce(from, latest).await?;
+            if !has_tx_latest {
+                warn!(%from, latest, pending, "Pool shows next nonce but no tx at latest; refusing to send");
+                return Ok(());
+            }
+        }
 
         info!(
-            "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {pending_nonce})",
+            "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {nonce_to_use})",
             hex::encode(block_hash)
         );
 
-        let mut backoff = ExponentialBackoff::default();
+        let mut backoff = ExponentialBackoff {
+            max_interval: Duration::from_secs(15),
+            max_elapsed_time: Some(Duration::from_secs(90)),
+            ..ExponentialBackoff::default()
+        };
         let mut rbf_count = 0u32;
 
         loop {
@@ -884,16 +988,17 @@ where
                 .unwrap_or((self.gas.min_tip, DEFAULT_BASE_FEE));
             if max_fee <= base_fee_now.saturating_add(tip) {
                 max_fee = base_fee_now.saturating_add(tip) + 1;
+                let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
                 info!(
                     "Adjusted max_fee to {} gwei for current base fee",
-                    max_fee / 1_000_000_000
+                    gwei(max_fee)
                 );
             }
 
             let tx_builder = self
                 .contract
                 .setBitcoinBlockData(confirmed_height, block_hash)
-                .nonce(pending_nonce)
+                .nonce(nonce_to_use)
                 .max_fee_per_gas(max_fee)
                 .max_priority_fee_per_gas(tip);
 
@@ -909,7 +1014,7 @@ where
                     if let Ok(mut in_flight) = self.in_flight_tx.write() {
                         *in_flight = Some(InFlightTransaction {
                             tx_hash,
-                            nonce: pending_nonce,
+                            nonce: nonce_to_use,
                             block_update: block_update.clone(),
                             submitted_at: now,
                             rbf_count,
@@ -925,6 +1030,8 @@ where
                             .map(|(_, base)| base);
                     if let Ok(mut status) = self.health_status.write() {
                         status.nonce_metrics.in_flight_count = 1;
+                        status.nonce_metrics.in_flight_nonce = Some(nonce_to_use);
+                        status.nonce_metrics.waiting_rbf = false;
                         status.nonce_metrics.last_submitted_height = Some(confirmed_height);
                         status.nonce_metrics.last_submitted_hash =
                             Some(format!("0x{}", hex::encode(block_hash)));
@@ -938,7 +1045,7 @@ where
                     }
 
                     info!(
-                        "Transaction submitted: 0x{} (nonce: {pending_nonce}, RBF: {rbf_count})",
+                        "Transaction submitted: 0x{} (nonce: {nonce_to_use}, RBF: {rbf_count})",
                         hex::encode(tx_hash)
                     );
 
@@ -957,15 +1064,22 @@ where
 
                     if Self::is_known_transaction_error(&err_str) {
                         info!("Transaction already known, keeping polling state");
-                        // Keep polling - set in-flight placeholder to continue monitoring
+
+                        let from = self.provider.default_signer_address();
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()
                             .as_secs();
+                        let resolved =
+                            Self::tx_hash_by_sender_and_nonce(&self.provider, from, nonce_to_use)
+                                .await
+                                .ok()
+                                .flatten();
+
                         if let Ok(mut slot) = self.in_flight_tx.write() {
                             *slot = Some(InFlightTransaction {
-                                tx_hash: B256::ZERO, // unknown hash, but keep the nonce/block_update
-                                nonce: pending_nonce,
+                                tx_hash: resolved.unwrap_or(B256::ZERO), // keep placeholder if still unknown
+                                nonce: nonce_to_use,
                                 block_update: block_update.clone(),
                                 submitted_at: now,
                                 rbf_count,
@@ -978,7 +1092,7 @@ where
                     if Self::is_underpriced_error(&err_str) {
                         rbf_count += 1;
                         if rbf_count > MAX_RBF_ATTEMPTS {
-                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded for confirmed_height {confirmed_height}, nonce {pending_nonce}");
+                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded for confirmed_height {confirmed_height}, nonce {nonce_to_use}");
                             warn!("{}", err);
                             return Err(Box::new(std::io::Error::other(err))
                                 as Box<dyn Error + Send + Sync>);
@@ -997,7 +1111,7 @@ where
                     if let Some(delay) = backoff.next_backoff() {
                         rbf_count += 1;
                         if rbf_count > MAX_RBF_ATTEMPTS {
-                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded during backoff for confirmed_height {confirmed_height}, nonce {pending_nonce}");
+                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded during backoff for confirmed_height {confirmed_height}, nonce {nonce_to_use}");
                             warn!("{}", err);
                             return Err(Box::new(std::io::Error::other(err))
                                 as Box<dyn Error + Send + Sync>);
@@ -1025,12 +1139,34 @@ where
         loop {
             // poll for receipts or RBF
             let tx_to_check = if let Ok(in_flight) = self.in_flight_tx.read() {
-                in_flight.clone()
+                (*in_flight).clone()
             } else {
                 None
             };
 
             if let Some(tx) = tx_to_check {
+                // Try to resolve zero hash before proceeding
+                if tx.tx_hash == B256::ZERO {
+                    if let Ok(Some(h)) = Self::tx_hash_by_sender_and_nonce(
+                        &self.provider,
+                        self.provider.default_signer_address(),
+                        tx.nonce,
+                    )
+                    .await
+                    {
+                        if let Ok(mut g) = self.in_flight_tx.write() {
+                            if let Some(mut cur) = g.take() {
+                                cur.tx_hash = h;
+                                *g = Some(cur);
+                            }
+                        }
+                    } else {
+                        debug!("Still no hash for nonce {}; retrying", tx.nonce);
+                        time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+
                 // Check if the in-flight transaction has been mined
                 match self.check_transaction_receipt(tx.tx_hash).await {
                     Ok(true) => {
@@ -1038,6 +1174,8 @@ where
 
                         // Mark block as processed and clear in-flight state
                         self.mark_as_processed(tx.block_update.clone());
+                        // Prune old entries to prevent unbounded growth
+                        self.prune_processed(tx.block_update.confirmed_height);
 
                         // Update metrics and status
                         if let Ok(mut status) = self.health_status.write() {
@@ -1049,6 +1187,8 @@ where
                                     .as_secs(),
                             );
                             status.nonce_metrics.in_flight_count = 0;
+                            status.nonce_metrics.in_flight_nonce = None;
+                            status.nonce_metrics.waiting_rbf = false;
                             status.nonce_metrics.nonce_latest = tx.nonce + 1;
                         }
 
@@ -1056,6 +1196,9 @@ where
                         if let Ok(mut in_flight_mut) = self.in_flight_tx.write() {
                             *in_flight_mut = None;
                         }
+
+                        // Refresh nonce metrics after clearing in-flight
+                        self.refresh_nonce_metrics().await;
                     }
                     Ok(false) => {
                         // Transaction still pending
@@ -1064,8 +1207,14 @@ where
                             .unwrap()
                             .as_secs();
 
+                        // Update waiting_rbf status based on how long we've been waiting
+                        let waiting_rbf = now - tx.submitted_at > self.rbf_timeout_seconds;
+                        if let Ok(mut status) = self.health_status.write() {
+                            status.nonce_metrics.waiting_rbf = waiting_rbf;
+                        }
+
                         // Check if we should RBF (Replace-By-Fee) after waiting too long
-                        if now - tx.submitted_at > self.rbf_timeout_seconds {
+                        if waiting_rbf {
                             warn!(
                                 "Transaction 0x{} taking too long, attempting RBF",
                                 hex::encode(tx.tx_hash)
@@ -1116,6 +1265,9 @@ where
                         hex::encode(block_hash)
                     );
 
+                    // Periodically prune old processed blocks to prevent unbounded growth
+                    self.prune_processed(confirmed_height);
+
                     if let Err(e) = self.update_contract(confirmed_height, block_hash).await {
                         warn!("Failed to update contract: {e}");
                         // Update health status on contract update failure
@@ -1164,6 +1316,8 @@ async fn handle_health_request(
                         "nonce_latest": status.nonce_metrics.nonce_latest,
                         "nonce_pending": status.nonce_metrics.nonce_pending,
                         "in_flight_count": status.nonce_metrics.in_flight_count,
+                        "in_flight_nonce": status.nonce_metrics.in_flight_nonce,
+                        "waiting_rbf": status.nonce_metrics.waiting_rbf,
                         "last_submitted": {
                             "height": status.nonce_metrics.last_submitted_height,
                             "hash": status.nonce_metrics.last_submitted_hash
@@ -1207,6 +1361,43 @@ async fn handle_health_request(
             Err(_) => (500, json!({"error": "Internal server error"}).to_string()),
         },
         "/live" => (200, json!({ "status": "alive" }).to_string()),
+        "/debug/nonces" => match health_status.read() {
+            Ok(status) => {
+                let in_flight_info = status.nonce_metrics.in_flight_nonce.map(|n| {
+                    json!({
+                        "nonce": n,
+                        "tx_hash": status.nonce_metrics.last_tx_hash,
+                        "rbf_count": status.nonce_metrics.last_rbf_count
+                    })
+                });
+
+                let will_refuse = status
+                    .nonce_metrics
+                    .nonce_pending
+                    .saturating_sub(status.nonce_metrics.nonce_latest)
+                    > 1;
+
+                let response = json!({
+                    "latest": status.nonce_metrics.nonce_latest,
+                    "pending": status.nonce_metrics.nonce_pending,
+                    "in_flight": in_flight_info,
+                    "will_refuse": will_refuse
+                });
+
+                (200, response.to_string())
+            }
+            Err(_) => (500, json!({"error": "Internal server error"}).to_string()),
+        },
+        "/debug/txpool" => {
+            // Return placeholder since we don't have provider access in the health handler
+            // In a real implementation, we would need to pass the provider or make RPC calls
+            let response = json!({
+                "pending": {},
+                "queued": {},
+                "note": "Placeholder implementation - would need provider access for txpool_content RPC"
+            });
+            (200, response.to_string())
+        }
         _ => (404, json!({"error": "Not found"}).to_string()),
     }
 }
@@ -1216,7 +1407,7 @@ async fn handle_connection(
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: &GasCfg,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let mut buffer = [0; 1024];
+    let mut buffer = [0; 8192]; // Increased for proxy compatibility
     let n = stream.read(&mut buffer).await?;
 
     let request = String::from_utf8_lossy(&buffer[..n]);
@@ -1273,16 +1464,16 @@ async fn start_health_server(
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> AnyResult<()> {
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     // Validate CLI flags
     if args.min_tip_gwei == 0 {
-        anyhow::bail!("--min-tip-gwei must be > 0");
+        bail!("--min-tip-gwei must be > 0");
     }
     if args.min_tip_gwei > args.max_fee_cap_gwei {
-        anyhow::bail!(
+        bail!(
             "--min-tip-gwei ({}) cannot exceed --max-fee-cap-gwei ({})",
             args.min_tip_gwei,
             args.max_fee_cap_gwei
@@ -1295,10 +1486,11 @@ async fn main() -> anyhow::Result<()> {
         max_fee_cap: args.max_fee_cap_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
     };
 
+    let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
     info!(
         "Gas policy: MIN_TIP={} gwei, MAX_FEE_CAP={} gwei",
-        gas_cfg.min_tip / 1_000_000_000,
-        gas_cfg.max_fee_cap / 1_000_000_000
+        gwei(gas_cfg.min_tip),
+        gwei(gas_cfg.max_fee_cap)
     );
 
     // Bitcoin RPC selection (unchanged)
@@ -1332,7 +1524,9 @@ async fn main() -> anyhow::Result<()> {
     // Type of `provider` is concrete and satisfies the bounds.
     let service = SyncService::new_with(&args, bitcoin_rpc, provider, gas_cfg.clone())
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to create sync service: {}", e))?;
+        .map_err(|e| anyhow!("Failed to create sync service: {}", e))?;
+
+    service.reconcile_nonces_on_start().await?;
 
     // rest unchanged...
     let update_interval = Duration::from_secs(args.update_interval);
