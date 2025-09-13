@@ -166,6 +166,10 @@ struct Args {
     /// Maximum maxFeePerGas cap in gwei (ceiling for fees)
     #[arg(long, default_value = "200")]
     max_fee_cap_gwei: u128,
+
+    /// Maximum nonce gap to allow for automated recovery
+    #[arg(long, default_value = "6000")]
+    max_gap_allow: u64,
 }
 
 impl Args {
@@ -313,6 +317,7 @@ where
     bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
     confirmation_blocks: u64,
     rbf_timeout_seconds: u64,
+    max_gap_allow: u64,
     health_status: Arc<RwLock<HealthStatus>>,
     processed_blocks: Arc<RwLock<HashSet<BitcoinBlockUpdate>>>,
     in_flight_tx: Arc<RwLock<Option<InFlightTransaction>>>,
@@ -339,6 +344,7 @@ where
             bitcoin_rpc,
             confirmation_blocks: args.confirmation_blocks,
             rbf_timeout_seconds: args.rbf_timeout_seconds,
+            max_gap_allow: args.max_gap_allow,
             health_status: Arc::new(RwLock::new(HealthStatus::new())),
             processed_blocks: Arc::new(RwLock::new(HashSet::new())),
             in_flight_tx: Arc::new(RwLock::new(None)),
@@ -627,15 +633,21 @@ where
 
         info!(%from, latest, pending, "Nonce reconciliation");
 
-        // Conservative check: if pending - latest > 1, we have multiple gaps
-        // This is safer than trying to scan individual transactions
-        if pending.saturating_sub(latest) > 1 {
-            let err = format!(
-                "Multiple nonce gaps detected: latest={}, pending={}, gap_size={}. Refusing to send to avoid flooding txpool.",
-                latest, pending, pending.saturating_sub(latest)
-            );
-            warn!(%from, latest, pending, "Multiple nonce gaps detected; refusing to send");
-            return Err(anyhow!(err));
+        let gap_size = pending.saturating_sub(latest);
+        if gap_size > 1 {
+            if gap_size > self.max_gap_allow {
+                let err = format!(
+                    "Excessive nonce gap detected: latest={}, pending={}, gap_size={}. Gap exceeds max_gap_allow={}. Refusing to start.",
+                    latest, pending, gap_size, self.max_gap_allow
+                );
+                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow, "Excessive nonce gap; refusing to start");
+                return Err(anyhow!(err));
+            } else {
+                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow,
+                    "Large gap detected (gap={}) ≤ max_gap_allow={}; proceeding to reclaim nonce {} via RBF",
+                    gap_size, self.max_gap_allow, latest);
+                // Do not return Err; proceed. The send path will RBF nonce=latest.
+            }
         }
 
         info!(%from, "Nonce reconciliation passed");
@@ -943,25 +955,40 @@ where
         }
 
         let (latest, pending) = self.get_nonces().await?;
-        let nonce_to_use = latest;
+        let from = self.provider.default_signer_address();
+        let has_tx_latest = self.tx_known_for_nonce(from, latest).await.unwrap_or(false);
 
-        // Assert nonce state is valid
-        if pending != latest && pending != latest + 1 {
-            let from = self.provider.default_signer_address();
-            warn!(
-                %from, latest, pending,
-                "Invalid nonce state; refusing to send"
-            );
-            return Ok(());
+        // New logic: allow send if either there's no tx at latest (we can claim it),
+        // or there IS a tx at latest (we'll RBF it).
+        if !has_tx_latest {
+            info!(%from, latest, pending, "No tx at latest; claiming nonce {}.", latest);
+        } else {
+            info!(%from, latest, pending, "Tx exists at latest; attempting RBF for nonce {}.", latest);
         }
+        let nonce_to_use = latest; // proceed either way
 
-        if pending == latest + 1 {
-            // Check if there's a transaction at the latest nonce (which should be the pending one)
-            let from = self.provider.default_signer_address();
-            let has_tx_latest = self.tx_known_for_nonce(from, latest).await?;
-            if !has_tx_latest {
-                warn!(%from, latest, pending, "Pool shows next nonce but no tx at latest; refusing to send");
-                return Ok(());
+        // Proactively resolve the unknown hash for metrics before sending
+        if has_tx_latest {
+            if let Ok(Some(hash)) =
+                Self::tx_hash_by_sender_and_nonce(&self.provider, from, latest).await
+            {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                if let Ok(mut slot) = self.in_flight_tx.write() {
+                    *slot = Some(InFlightTransaction {
+                        tx_hash: hash,
+                        nonce: latest,
+                        block_update: BitcoinBlockUpdate {
+                            confirmed_height,
+                            hash: block_hash,
+                        },
+                        submitted_at: now,
+                        rbf_count: 0,
+                        last_tip: self.gas.min_tip,
+                    });
+                }
             }
         }
 
@@ -1294,6 +1321,7 @@ async fn handle_health_request(
     path: &str,
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: &GasCfg,
+    max_gap_allow: u64,
 ) -> (u16, String) {
     match path {
         "/health" => match health_status.read() {
@@ -1371,17 +1399,19 @@ async fn handle_health_request(
                     })
                 });
 
-                let will_refuse = status
+                let gap = status
                     .nonce_metrics
                     .nonce_pending
-                    .saturating_sub(status.nonce_metrics.nonce_latest)
-                    > 1;
+                    .saturating_sub(status.nonce_metrics.nonce_latest);
+                let will_refuse = gap > max_gap_allow;
 
                 let response = json!({
                     "latest": status.nonce_metrics.nonce_latest,
                     "pending": status.nonce_metrics.nonce_pending,
+                    "gap": gap,
+                    "max_gap_allow": max_gap_allow,
                     "in_flight": in_flight_info,
-                    "will_refuse": will_refuse
+                    "will_refuse_on_start": will_refuse
                 });
 
                 (200, response.to_string())
@@ -1406,6 +1436,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: &GasCfg,
+    max_gap_allow: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buffer = [0; 8192]; // Increased for proxy compatibility
     let n = stream.read(&mut buffer).await?;
@@ -1417,7 +1448,8 @@ async fn handle_connection(
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
-    let (status_code, body) = handle_health_request(path, health_status, gas_cfg).await;
+    let (status_code, body) =
+        handle_health_request(path, health_status, gas_cfg, max_gap_allow).await;
 
     let status_text = match status_code {
         200 => "OK",
@@ -1445,6 +1477,7 @@ async fn handle_connection(
 async fn start_health_server(
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: GasCfg,
+    max_gap_allow: u64,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -1454,9 +1487,17 @@ async fn start_health_server(
         let (stream, _) = listener.accept().await?;
         let health_status_clone = health_status.clone();
         let gas_cfg_clone = gas_cfg.clone();
+        let max_gap_allow_clone = max_gap_allow;
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, health_status_clone, &gas_cfg_clone).await {
+            if let Err(e) = handle_connection(
+                stream,
+                health_status_clone,
+                &gas_cfg_clone,
+                max_gap_allow_clone,
+            )
+            .await
+            {
                 warn!("Error handling health check connection: {}", e);
             }
         });
@@ -1540,7 +1581,7 @@ async fn main() -> AnyResult<()> {
 
     tokio::select! {
         _ = service.run(update_interval) => warn!("Sync service exited unexpectedly"),
-        result = start_health_server(health_status, gas_cfg.clone(), health_port) => {
+        result = start_health_server(health_status, gas_cfg.clone(), args.max_gap_allow, health_port) => {
             if let Err(e) = result { warn!("Health server failed: {e}"); }
         }
     }
