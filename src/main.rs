@@ -1,16 +1,19 @@
 use alloy::{
     hex,
     network::EthereumWallet,
-    primitives::{Address, B256},
-    providers::ProviderBuilder,
+    primitives::{Address, B256, U256},
+    providers::{Provider, WalletProvider},
+    rpc::types::BlockNumberOrTag,
     signers::local::PrivateKeySigner,
     sol,
 };
 use async_trait::async_trait;
+use backoff::{backoff::Backoff, ExponentialBackoff};
 use bitcoincore_rpc::{Auth, Client as CoreClient, RpcApi};
 use clap::Parser;
 use serde_json::{json, Value};
 use std::{
+    collections::HashSet,
     error::Error,
     str::FromStr,
     sync::{
@@ -24,9 +27,16 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-// Define the contract ABI using alloy's sol! macro
+// Gas management constants
+const MAX_RBF_ATTEMPTS: u32 = 8;
+const MIN_TIP: u128 = 1_000_000_000; // 1 gwei
+const MAX_FEE_CAP: u128 = 200_000_000_000; // 200 gwei
+const DEFAULT_BASE_FEE: u128 = 1_000_000_000; // 1 gwei fallback
+const BUMP_MULTIPLIER: u32 = 15; // 15% increase per RBF
+
+// SovaL1Block contract interface
 sol! {
     #[sol(rpc)]
     contract SovaL1Block {
@@ -34,6 +44,22 @@ sol! {
         function currentBlockHeight() external view returns (uint64);
         function blockHashSixBlocksBack() external view returns (bytes32);
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct NonceMetrics {
+    pub nonce_latest: u64,
+    pub nonce_pending: u64,
+    pub in_flight_count: u32,
+    pub last_submitted_height: Option<u64>,
+    pub last_submitted_hash: Option<String>,
+    pub last_mined_height: Option<u64>,
+    pub last_mined_hash: Option<String>,
+    pub last_tx_hash: Option<String>,
+    pub last_rbf_count: u32,
+    pub last_max_fee_per_gas: Option<u128>,
+    pub last_priority_fee_per_gas: Option<u128>,
+    pub observed_base_fee: Option<u128>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +71,7 @@ struct HealthStatus {
     pub sequencer_rpc_healthy: bool,
     pub total_updates: u64,
     pub last_error: Option<String>,
+    pub nonce_metrics: NonceMetrics,
 }
 
 impl HealthStatus {
@@ -60,6 +87,7 @@ impl HealthStatus {
             sequencer_rpc_healthy: false,
             total_updates: 0,
             last_error: None,
+            nonce_metrics: NonceMetrics::default(),
         }
     }
 
@@ -115,6 +143,10 @@ struct Args {
     /// Health check HTTP port
     #[arg(long, default_value = "8080")]
     health_port: u16,
+
+    /// RBF timeout in seconds
+    #[arg(long, default_value = "60")]
+    rbf_timeout_seconds: u64,
 }
 
 impl Args {
@@ -214,72 +246,218 @@ impl ExternalRpcClient {
             .json()
             .await
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        Ok(json)
+
+        if json.get("error").is_some() && !json["error"].is_null() {
+            return Err(format!("RPC error on {method}: {}", json["error"]).into());
+        }
+        Ok(json["result"].clone())
     }
 }
 
 #[async_trait]
 impl BitcoinRpcClient for ExternalRpcClient {
     async fn get_block_count(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
-        let json = self.call_rpc("getblockcount", Vec::new()).await?;
-        let result: u64 = serde_json::from_value(json["result"].clone())
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        let res = self.call_rpc("getblockcount", Vec::new()).await?;
+        let result: u64 =
+            serde_json::from_value(res).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         Ok(result)
     }
 
     async fn get_block_hash(&self, height: u64) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let json = self.call_rpc("getblockhash", vec![json!(height)]).await?;
-        let result: String = serde_json::from_value(json["result"].clone())
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+        let res = self.call_rpc("getblockhash", vec![json!(height)]).await?;
+        let result: String =
+            serde_json::from_value(res).map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
         Ok(result)
     }
 }
 
-struct AdminService {
-    bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
-    sequencer_rpc_url: String,
-    admin_private_key: String,
-    contract_address: Address,
-    confirmation_blocks: u64,
-    health_status: Arc<RwLock<HealthStatus>>,
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BitcoinBlockUpdate {
+    confirmed_height: u64, // The actual confirmed block height
+    hash: B256,            // Hash at the confirmed height
 }
 
-impl AdminService {
-    async fn new(args: &Args) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let connection_type = args
-            .parse_connection_type()
-            .map_err(|e| Box::new(std::io::Error::other(e)) as Box<dyn Error + Send + Sync>)?;
-        let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match connection_type.as_str() {
-            "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
-                &args.btc_rpc_url,
-                &args.btc_rpc_user,
-                &args.btc_rpc_password,
-            )?),
-            "external" => Arc::new(ExternalRpcClient::new(
-                args.btc_rpc_url.clone(),
-                args.btc_rpc_user.clone(),
-                args.btc_rpc_password.clone(),
-            )),
-            _ => unreachable!(),
-        };
+#[derive(Debug, Clone)]
+struct InFlightTransaction {
+    tx_hash: B256,
+    nonce: u64,
+    block_update: BitcoinBlockUpdate,
+    submitted_at: u64,
+    rbf_count: u32,
+    last_tip: u128,
+}
 
-        // Parse contract address
-        let contract_address: Address = args
-            .contract_address
-            .parse()
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+struct SyncService<P>
+where
+    P: Provider + WalletProvider + Clone + Send + Sync + 'static,
+{
+    bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
+    confirmation_blocks: u64,
+    rbf_timeout_seconds: u64,
+    health_status: Arc<RwLock<HealthStatus>>,
+    processed_blocks: Arc<RwLock<HashSet<BitcoinBlockUpdate>>>,
+    in_flight_tx: Arc<RwLock<Option<InFlightTransaction>>>,
+    provider: P,
+    contract: SovaL1Block::SovaL1BlockInstance<P>,
+}
+
+impl<P> SyncService<P>
+where
+    P: Provider + WalletProvider + Clone + Send + Sync + 'static,
+{
+    async fn new_with(
+        args: &Args,
+        bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
+        provider: P,
+    ) -> Result<Self, Box<dyn Error + Send + Sync>> {
+        // Parse contract address once
+        let contract_address: Address = args.contract_address.parse()?;
+        let contract = SovaL1Block::new(contract_address, provider.clone());
 
         Ok(Self {
             bitcoin_rpc,
-            sequencer_rpc_url: args.sequencer_rpc_url.clone(),
-            admin_private_key: args.admin_private_key.clone(),
-            contract_address,
             confirmation_blocks: args.confirmation_blocks,
+            rbf_timeout_seconds: args.rbf_timeout_seconds,
             health_status: Arc::new(RwLock::new(HealthStatus::new())),
+            processed_blocks: Arc::new(RwLock::new(HashSet::new())),
+            in_flight_tx: Arc::new(RwLock::new(None)),
+            provider,
+            contract,
         })
     }
 
-    async fn get_bitcoin_block_data(&self) -> Result<(u64, B256), Box<dyn Error + Send + Sync>> {
+    async fn suggest_tip_and_basefee_with<T: Provider>(
+        provider: &T,
+    ) -> Result<(u128, u128), Box<dyn Error + Send + Sync>> {
+        // 1) Try feeHistory for last 5 blocks, 50th percentile
+        if let Ok(hist) = provider
+            .get_fee_history(
+                5u64,                      // blockCount
+                BlockNumberOrTag::Pending, // newestBlock
+                &[50.0],                   // reward percentiles
+            )
+            .await
+        {
+            let base_fees = hist.base_fee_per_gas;
+            // base_fee of the pending block is last baseFee in feeHistory
+            let base = match base_fees.last() {
+                Some(v) => {
+                    let u256_val = U256::from(*v);
+                    u256_val.to::<u128>().min(MAX_FEE_CAP)
+                }
+                None => DEFAULT_BASE_FEE,
+            };
+
+            // reward is Vec<Vec<u128 or U256>>; use last reward's 50th percentile
+            if let Some(rew) = hist.reward.as_ref().and_then(|r| r.last()) {
+                if let Some(mid) = rew.first() {
+                    // Cast robustly
+                    let u256_tip = U256::from(*mid);
+                    let tip = u256_tip.to::<u128>().clamp(MIN_TIP, MAX_FEE_CAP);
+                    debug!(
+                        "Fee history: base={} gwei, tip={} gwei",
+                        base / 1_000_000_000,
+                        tip / 1_000_000_000
+                    );
+                    return Ok((tip, base));
+                }
+            }
+            return Ok((MIN_TIP, base));
+        }
+
+        // 2) Fallback to maxPriorityFeePerGas + pending.baseFee
+        let tip_fallback = provider
+            .get_max_priority_fee_per_gas()
+            .await
+            .ok()
+            .map(|v| {
+                let u256_val = U256::from(v);
+                u256_val.to::<u128>().clamp(MIN_TIP, MAX_FEE_CAP)
+            })
+            .unwrap_or(MIN_TIP);
+
+        let base = provider
+            .get_block_by_number(BlockNumberOrTag::Pending)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|b| b.header.base_fee_per_gas)
+            .map(|v| (v as u128).min(MAX_FEE_CAP))
+            .unwrap_or(DEFAULT_BASE_FEE);
+
+        debug!(
+            "Fee fallback: base={} gwei, tip={} gwei",
+            base / 1_000_000_000,
+            tip_fallback / 1_000_000_000
+        );
+        Ok((tip_fallback, base))
+    }
+
+    async fn calculate_gas_fees_with<T: Provider>(
+        provider: &T,
+        rbf_count: u32,
+        last_tip: Option<u128>,
+    ) -> (u128, u128) {
+        let (suggested_tip, base_fee) = Self::suggest_tip_and_basefee_with(provider)
+            .await
+            .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+
+        // Strictly increasing priority fee
+        let mut tip = last_tip
+            .map(|t| t.saturating_mul(100 + BUMP_MULTIPLIER as u128) / 100)
+            .unwrap_or(suggested_tip)
+            .max(MIN_TIP);
+
+        // Cap tip
+        tip = tip.min(MAX_FEE_CAP);
+
+        // Ensure headroom above base fee, and bump with attempts
+        let mut max_fee = base_fee
+            .saturating_add(tip)
+            .saturating_mul(100 + (BUMP_MULTIPLIER as u128 * rbf_count as u128))
+            / 100;
+
+        // Invariants and cap: enforce max_fee >= base_fee + tip at calculation time
+        max_fee = max_fee.max(base_fee.saturating_add(tip) + 1);
+        if max_fee <= tip {
+            max_fee = tip + 1;
+        }
+        max_fee = max_fee.min(MAX_FEE_CAP);
+
+        info!(
+            "Gas calculation: base_fee={} gwei, tip={} gwei, max_fee={} gwei (RBF: {rbf_count})",
+            base_fee / 1_000_000_000,
+            tip / 1_000_000_000,
+            max_fee / 1_000_000_000
+        );
+
+        (max_fee, tip)
+    }
+
+    fn is_underpriced_error(err_str: &str) -> bool {
+        let s = err_str.to_lowercase();
+        s.contains("replacement transaction underpriced")
+            || s.contains("replacement underpriced")
+            || s.contains("fee too low")
+            || s.contains("underpriced")
+            || s.contains("max fee per gas less than block base fee")
+            || s.contains("tip too low")
+            || s.contains("intrinsic gas too low") // sometimes a side effect
+    }
+
+    fn is_nonce_too_low_error(err_str: &str) -> bool {
+        let s = err_str.to_lowercase();
+        s.contains("nonce too low")
+    }
+
+    fn is_known_transaction_error(err_str: &str) -> bool {
+        let s = err_str.to_lowercase();
+        s.contains("already known") || s.contains("known transaction")
+    }
+
+    async fn get_bitcoin_block_data(
+        &self,
+    ) -> Result<(u64, u64, B256), Box<dyn Error + Send + Sync>> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -307,75 +485,449 @@ impl AdminService {
 
         // Calculate the height for the confirmation block
         // saturating_sub returns 0 if the subtraction would underflow
-        let target_height = current_height.saturating_sub(self.confirmation_blocks);
+        let confirmed_height = current_height.saturating_sub(self.confirmation_blocks);
 
-        // Get the block hash at the target height
-        let block_hash_str = self.bitcoin_rpc.get_block_hash(target_height).await?;
+        // Get the block hash at the confirmed height
+        let block_hash_str = self.bitcoin_rpc.get_block_hash(confirmed_height).await?;
 
         // Convert hex string to B256
         let block_hash = B256::from_str(&block_hash_str)
             .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
 
-        Ok((current_height, block_hash))
+        Ok((current_height, confirmed_height, block_hash))
+    }
+
+    async fn get_pending_nonce(&self) -> Result<u64, Box<dyn Error + Send + Sync>> {
+        let mut backoff = ExponentialBackoff::default();
+        let from = self.provider.default_signer_address();
+
+        loop {
+            match self.provider.get_transaction_count(from).pending().await {
+                Ok(nonce) => {
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.nonce_metrics.nonce_pending = nonce;
+                    }
+                    return Ok(nonce);
+                }
+                Err(e) => {
+                    warn!("Failed to get pending nonce: {e}");
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.last_error = Some(format!("Nonce fetch error: {e}"));
+                    }
+
+                    if let Some(delay) = backoff.next_backoff() {
+                        time::sleep(delay).await;
+                    } else {
+                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn refresh_nonce_metrics(&self) {
+        // Get both latest and pending nonces for reconciliation using stored provider
+        let from = self.provider.default_signer_address();
+
+        if let Ok(latest) = self.provider.get_transaction_count(from).latest().await {
+            if let Ok(mut s) = self.health_status.write() {
+                s.nonce_metrics.nonce_latest = latest;
+            }
+        }
+
+        if let Ok(pending) = self.provider.get_transaction_count(from).pending().await {
+            if let Ok(mut s) = self.health_status.write() {
+                s.nonce_metrics.nonce_pending = pending;
+            }
+        }
+    }
+
+    async fn check_transaction_receipt(
+        &self,
+        tx_hash: B256,
+    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
+        let mut backoff = ExponentialBackoff::default();
+
+        loop {
+            match self.provider.get_transaction_receipt(tx_hash).await {
+                Ok(Some(receipt)) => {
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.nonce_metrics.last_mined_height =
+                            Some(receipt.block_number.unwrap_or_default());
+                        status.nonce_metrics.last_mined_hash = Some(format!(
+                            "0x{}",
+                            hex::encode(receipt.block_hash.unwrap_or_default())
+                        ));
+                    }
+                    return Ok(true);
+                }
+                Ok(None) => return Ok(false),
+                Err(e) => {
+                    warn!("Failed to check transaction receipt: {e}");
+
+                    if let Some(delay) = backoff.next_backoff() {
+                        time::sleep(delay).await;
+                    } else {
+                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+                    }
+                }
+            }
+        }
+    }
+
+    fn is_already_processed(&self, block_update: &BitcoinBlockUpdate) -> bool {
+        if let Ok(processed) = self.processed_blocks.read() {
+            processed.contains(block_update)
+        } else {
+            false
+        }
+    }
+
+    fn mark_as_processed(&self, block_update: BitcoinBlockUpdate) {
+        if let Ok(mut processed) = self.processed_blocks.write() {
+            processed.insert(block_update);
+        }
+    }
+
+    async fn update_contract_with_rbf(
+        &self,
+        confirmed_height: u64,
+        block_hash: B256,
+        nonce: u64,
+        rbf_count: u32,
+        last_tip: Option<u128>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let block_update = BitcoinBlockUpdate {
+            confirmed_height,
+            hash: block_hash,
+        };
+
+        // Deduplicate by BTC state
+        if self.is_already_processed(&block_update) {
+            info!("Contract update not necessary, BTC block update already processed: confirmed_height={confirmed_height}, hash=0x{}", hex::encode(block_hash));
+            return Ok(());
+        }
+
+        // Check RBF attempt limit
+        if rbf_count > MAX_RBF_ATTEMPTS {
+            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded for nonce {nonce}");
+            warn!("{}", err);
+            if let Ok(mut status) = self.health_status.write() {
+                status.last_error = Some(err.clone());
+            }
+            return Err(Box::new(std::io::Error::other(err)) as Box<dyn Error + Send + Sync>);
+        }
+
+        info!(
+            "Updating contract with RBF #{rbf_count}: confirmed_height {confirmed_height}, hash 0x{}, nonce: {nonce}",
+            hex::encode(block_hash)
+        );
+
+        let mut current_rbf_count = rbf_count;
+
+        loop {
+            // Calculate gas fees with Reth's fee history API using stored provider
+            let (mut max_fee, tip) =
+                Self::calculate_gas_fees_with(&self.provider, current_rbf_count, last_tip).await;
+
+            // Enforce base_fee + tip at send time (base fee can move)
+            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider)
+                .await
+                .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+            if max_fee <= base_fee_now.saturating_add(tip) {
+                max_fee = base_fee_now.saturating_add(tip) + 1;
+                info!(
+                    "Adjusted max_fee to {} gwei for current base fee",
+                    max_fee / 1_000_000_000
+                );
+            }
+
+            let tx_builder = self
+                .contract
+                .setBitcoinBlockData(confirmed_height, block_hash)
+                .nonce(nonce)
+                .max_fee_per_gas(max_fee)
+                .max_priority_fee_per_gas(tip);
+
+            match tx_builder.send().await {
+                Ok(tx) => {
+                    let tx_hash = *tx.tx_hash();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+
+                    // Store in-flight transaction
+                    if let Ok(mut in_flight) = self.in_flight_tx.write() {
+                        *in_flight = Some(InFlightTransaction {
+                            tx_hash,
+                            nonce,
+                            block_update: block_update.clone(),
+                            submitted_at: now,
+                            rbf_count: current_rbf_count,
+                            last_tip: tip,
+                        });
+                    }
+
+                    // Update metrics with fee information
+                    let observed_base = Self::suggest_tip_and_basefee_with(&self.provider)
+                        .await
+                        .ok()
+                        .map(|(_, base)| base);
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.nonce_metrics.in_flight_count = 1;
+                        status.nonce_metrics.last_submitted_height = Some(confirmed_height);
+                        status.nonce_metrics.last_submitted_hash =
+                            Some(format!("0x{}", hex::encode(block_hash)));
+                        status.nonce_metrics.last_tx_hash =
+                            Some(format!("0x{}", hex::encode(tx_hash)));
+                        status.nonce_metrics.last_rbf_count = current_rbf_count;
+                        status.nonce_metrics.last_max_fee_per_gas = Some(max_fee);
+                        status.nonce_metrics.last_priority_fee_per_gas = Some(tip);
+                        status.nonce_metrics.observed_base_fee = observed_base;
+                        status.sequencer_rpc_healthy = true;
+                    }
+
+                    info!(
+                        "RBF transaction submitted: 0x{} (nonce: {nonce}, RBF: {current_rbf_count})",
+                        hex::encode(tx_hash)
+                    );
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Handle specific error types with improved matching
+                    if Self::is_nonce_too_low_error(&err_str) {
+                        warn!("Nonce too low - reconciling state and refreshing metrics");
+                        // Refresh nonce metrics to get latest state
+                        self.refresh_nonce_metrics().await;
+                        // Clear in-flight and let normal flow check contract state
+                        if let Ok(mut in_flight) = self.in_flight_tx.write() {
+                            *in_flight = None;
+                        }
+                        return Ok(());
+                    }
+
+                    if Self::is_known_transaction_error(&err_str) {
+                        info!("Transaction already known, keeping polling state");
+                        // Keep polling - set in-flight placeholder to continue monitoring
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        if let Ok(mut slot) = self.in_flight_tx.write() {
+                            *slot = Some(InFlightTransaction {
+                                tx_hash: B256::ZERO, // unknown hash, but keep the nonce/block_update
+                                nonce,
+                                block_update: block_update.clone(),
+                                submitted_at: now,
+                                rbf_count: current_rbf_count,
+                                last_tip: tip,
+                            });
+                        }
+                        return Ok(());
+                    }
+
+                    if Self::is_underpriced_error(&err_str) {
+                        current_rbf_count += 1;
+                        if current_rbf_count > MAX_RBF_ATTEMPTS {
+                            warn!("Max RBF attempts exceeded after replacement underpriced error");
+                            break;
+                        }
+                        warn!("Replacement underpriced, retrying with higher fees (attempt {current_rbf_count})");
+                        continue; // retry immediately with higher fees
+                    }
+
+                    warn!("Failed to submit RBF transaction: {e}");
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.sequencer_rpc_healthy = false;
+                        status.last_error = Some(format!("RBF transaction submit error: {e}"));
+                    }
+                    return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+                }
+            }
+        }
+
+        let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded for confirmed_height {confirmed_height}, nonce {nonce}");
+        warn!("{}", err);
+        Err(Box::new(std::io::Error::other(err)) as Box<dyn Error + Send + Sync>)
     }
 
     async fn update_contract(
         &self,
-        block_height: u64,
+        confirmed_height: u64,
         block_hash: B256,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let block_update = BitcoinBlockUpdate {
+            confirmed_height,
+            hash: block_hash,
+        };
+
+        // Deduplicate by BTC state
+        if self.is_already_processed(&block_update) {
+            info!("Contract update not necessary, BTC block update already processed: confirmed_height={confirmed_height}, hash=0x{}", hex::encode(block_hash));
+            return Ok(());
+        }
+
+        // Use pending nonce and cap in-flight = 1
+        if let Ok(in_flight) = self.in_flight_tx.read() {
+            if in_flight.is_some() {
+                debug!("Transaction already in flight, skipping new submission");
+                return Ok(());
+            }
+        }
+
+        let pending_nonce = self.get_pending_nonce().await?;
+
         info!(
-            "Updating contract with block height {block_height} and hash 0x{}",
+            "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {pending_nonce})",
             hex::encode(block_hash)
         );
 
-        // Parse private key and create signer
-        let private_key = self.admin_private_key.trim_start_matches("0x");
-        let signer: PrivateKeySigner = private_key
-            .parse()
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-        let wallet = EthereumWallet::from(signer);
+        let mut backoff = ExponentialBackoff::default();
+        let mut rbf_count = 0u32;
 
-        // Create provider with wallet
-        let provider = ProviderBuilder::new().wallet(wallet).connect_http(
-            self.sequencer_rpc_url
-                .parse()
-                .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?,
-        );
+        loop {
+            // Calculate gas fees with Reth's fee history API using stored provider
+            let (mut max_fee, tip) =
+                Self::calculate_gas_fees_with(&self.provider, rbf_count, None).await;
 
-        // Create contract instance
-        let contract = SovaL1Block::new(self.contract_address, provider);
+            // Enforce base_fee + tip at send time (base fee can move)
+            let (_, base_fee_now) = Self::suggest_tip_and_basefee_with(&self.provider)
+                .await
+                .unwrap_or((MIN_TIP, DEFAULT_BASE_FEE));
+            if max_fee <= base_fee_now.saturating_add(tip) {
+                max_fee = base_fee_now.saturating_add(tip) + 1;
+                info!(
+                    "Adjusted max_fee to {} gwei for current base fee",
+                    max_fee / 1_000_000_000
+                );
+            }
 
-        let tx = contract
-            .setBitcoinBlockData(block_height, block_hash)
-            .send()
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            let tx_builder = self
+                .contract
+                .setBitcoinBlockData(confirmed_height, block_hash)
+                .nonce(pending_nonce)
+                .max_fee_per_gas(max_fee)
+                .max_priority_fee_per_gas(tip);
 
-        let receipt = tx
-            .get_receipt()
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
+            match tx_builder.send().await {
+                Ok(tx) => {
+                    let tx_hash = *tx.tx_hash();
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
 
-        info!(
-            "Transaction successful: 0x{} (block: {})",
-            hex::encode(receipt.transaction_hash),
-            receipt.block_number.unwrap_or_default()
-        );
+                    // Store in-flight transaction
+                    if let Ok(mut in_flight) = self.in_flight_tx.write() {
+                        *in_flight = Some(InFlightTransaction {
+                            tx_hash,
+                            nonce: pending_nonce,
+                            block_update: block_update.clone(),
+                            submitted_at: now,
+                            rbf_count,
+                            last_tip: tip,
+                        });
+                    }
 
-        // Update health status - successful contract update
-        if let Ok(mut status) = self.health_status.write() {
-            status.sequencer_rpc_healthy = true;
-            status.last_contract_update = Some(
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs(),
-            );
-            status.total_updates += 1;
+                    // Update metrics with fee information
+                    let observed_base = Self::suggest_tip_and_basefee_with(&self.provider)
+                        .await
+                        .ok()
+                        .map(|(_, base)| base);
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.nonce_metrics.in_flight_count = 1;
+                        status.nonce_metrics.last_submitted_height = Some(confirmed_height);
+                        status.nonce_metrics.last_submitted_hash =
+                            Some(format!("0x{}", hex::encode(block_hash)));
+                        status.nonce_metrics.last_tx_hash =
+                            Some(format!("0x{}", hex::encode(tx_hash)));
+                        status.nonce_metrics.last_rbf_count = rbf_count;
+                        status.nonce_metrics.last_max_fee_per_gas = Some(max_fee);
+                        status.nonce_metrics.last_priority_fee_per_gas = Some(tip);
+                        status.nonce_metrics.observed_base_fee = observed_base;
+                        status.sequencer_rpc_healthy = true;
+                    }
+
+                    info!(
+                        "Transaction submitted: 0x{} (nonce: {pending_nonce}, RBF: {rbf_count})",
+                        hex::encode(tx_hash)
+                    );
+
+                    return Ok(());
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+
+                    // Handle specific error types with improved matching
+                    if Self::is_nonce_too_low_error(&err_str) {
+                        warn!("Nonce too low - reconciling state and refreshing metrics");
+                        // Refresh nonce metrics to get latest state
+                        self.refresh_nonce_metrics().await;
+                        return Ok(());
+                    }
+
+                    if Self::is_known_transaction_error(&err_str) {
+                        info!("Transaction already known, keeping polling state");
+                        // Keep polling - set in-flight placeholder to continue monitoring
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+                        if let Ok(mut slot) = self.in_flight_tx.write() {
+                            *slot = Some(InFlightTransaction {
+                                tx_hash: B256::ZERO, // unknown hash, but keep the nonce/block_update
+                                nonce: pending_nonce,
+                                block_update: block_update.clone(),
+                                submitted_at: now,
+                                rbf_count,
+                                last_tip: tip,
+                            });
+                        }
+                        return Ok(());
+                    }
+
+                    if Self::is_underpriced_error(&err_str) {
+                        rbf_count += 1;
+                        if rbf_count > MAX_RBF_ATTEMPTS {
+                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded for confirmed_height {confirmed_height}, nonce {pending_nonce}");
+                            warn!("{}", err);
+                            return Err(Box::new(std::io::Error::other(err))
+                                as Box<dyn Error + Send + Sync>);
+                        }
+                        warn!("Transaction underpriced, retrying with higher fees immediately (attempt {rbf_count})");
+                        continue; // retry immediately with higher fees
+                    }
+
+                    warn!("Failed to submit transaction: {e}");
+                    if let Ok(mut status) = self.health_status.write() {
+                        status.sequencer_rpc_healthy = false;
+                        status.last_error = Some(format!("Transaction submit error: {e}"));
+                    }
+
+                    // Backoff & jitter on RPC error or timeout
+                    if let Some(delay) = backoff.next_backoff() {
+                        rbf_count += 1;
+                        if rbf_count > MAX_RBF_ATTEMPTS {
+                            let err = format!("Max RBF attempts ({MAX_RBF_ATTEMPTS}) exceeded during backoff for confirmed_height {confirmed_height}, nonce {pending_nonce}");
+                            warn!("{}", err);
+                            return Err(Box::new(std::io::Error::other(err))
+                                as Box<dyn Error + Send + Sync>);
+                        }
+                        info!(
+                            "Retrying transaction with RBF in {:?} (attempt {})",
+                            delay, rbf_count
+                        );
+                        time::sleep(delay).await;
+                    } else {
+                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
+                    }
+                }
+            }
         }
-
-        Ok(())
     }
 
     async fn run(&self, update_interval: Duration) {
@@ -386,16 +938,100 @@ impl AdminService {
         info!("Confirmation blocks: {}", self.confirmation_blocks);
 
         loop {
+            // poll for receipts or RBF
+            let tx_to_check = if let Ok(in_flight) = self.in_flight_tx.read() {
+                in_flight.clone()
+            } else {
+                None
+            };
+
+            if let Some(tx) = tx_to_check {
+                // Check if the in-flight transaction has been mined
+                match self.check_transaction_receipt(tx.tx_hash).await {
+                    Ok(true) => {
+                        info!("Transaction 0x{} confirmed!", hex::encode(tx.tx_hash));
+
+                        // Mark block as processed and clear in-flight state
+                        self.mark_as_processed(tx.block_update.clone());
+
+                        // Update metrics and status
+                        if let Ok(mut status) = self.health_status.write() {
+                            status.total_updates += 1;
+                            status.last_contract_update = Some(
+                                SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .unwrap()
+                                    .as_secs(),
+                            );
+                            status.nonce_metrics.in_flight_count = 0;
+                            status.nonce_metrics.nonce_latest = tx.nonce + 1;
+                        }
+
+                        // Clear in-flight transaction
+                        if let Ok(mut in_flight_mut) = self.in_flight_tx.write() {
+                            *in_flight_mut = None;
+                        }
+                    }
+                    Ok(false) => {
+                        // Transaction still pending
+                        let now = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap()
+                            .as_secs();
+
+                        // Check if we should RBF (Replace-By-Fee) after waiting too long
+                        if now - tx.submitted_at > self.rbf_timeout_seconds {
+                            warn!(
+                                "Transaction 0x{} taking too long, attempting RBF",
+                                hex::encode(tx.tx_hash)
+                            );
+
+                            // Clear in-flight to allow re-submission with higher gas
+                            if let Ok(mut in_flight_mut) = self.in_flight_tx.write() {
+                                *in_flight_mut = None;
+                            }
+
+                            // Try to re-submit with same nonce but higher gas (RBF)
+                            if let Err(e) = self
+                                .update_contract_with_rbf(
+                                    tx.block_update.confirmed_height,
+                                    tx.block_update.hash,
+                                    tx.nonce,
+                                    tx.rbf_count + 1,
+                                    Some(tx.last_tip),
+                                )
+                                .await
+                            {
+                                warn!("RBF failed: {e}");
+                            }
+                        } else {
+                            info!("Transaction 0x{} still pending...", hex::encode(tx.tx_hash));
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to check receipt for 0x{}: {e}",
+                            hex::encode(tx.tx_hash)
+                        );
+                    }
+                }
+
+                // Sleep shorter when monitoring in-flight transaction
+                time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+
+            // Normal interval tick when no in-flight transactions
             interval.tick().await;
 
             match self.get_bitcoin_block_data().await {
-                Ok((block_height, block_hash)) => {
-                    info!(
-                        "Bitcoin block data: height={block_height}, hash=0x{}",
+                Ok((current_height, confirmed_height, block_hash)) => {
+                    debug!(
+                        "Retrieved Bitcoin block data: current_height={current_height}, confirmed_height={confirmed_height}, hash=0x{}",
                         hex::encode(block_hash)
                     );
 
-                    if let Err(e) = self.update_contract(block_height, block_hash).await {
+                    if let Err(e) = self.update_contract(confirmed_height, block_hash).await {
                         warn!("Failed to update contract: {e}");
                         // Update health status on contract update failure
                         if let Ok(mut status) = self.health_status.write() {
@@ -437,7 +1073,28 @@ async fn handle_health_request(
                     "last_bitcoin_check": status.last_bitcoin_check,
                     "last_contract_update": status.last_contract_update,
                     "total_updates": status.total_updates,
-                    "last_error": status.last_error
+                    "last_error": status.last_error,
+                    "nonce_metrics": {
+                        "nonce_latest": status.nonce_metrics.nonce_latest,
+                        "nonce_pending": status.nonce_metrics.nonce_pending,
+                        "in_flight_count": status.nonce_metrics.in_flight_count,
+                        "last_submitted": {
+                            "height": status.nonce_metrics.last_submitted_height,
+                            "hash": status.nonce_metrics.last_submitted_hash
+                        },
+                        "last_mined": {
+                            "height": status.nonce_metrics.last_mined_height,
+                            "hash": status.nonce_metrics.last_mined_hash
+                        },
+                        "last_tx_hash": status.nonce_metrics.last_tx_hash,
+                        "last_rbf_count": status.nonce_metrics.last_rbf_count,
+                        "last_max_fee_per_gas": status.nonce_metrics.last_max_fee_per_gas.map(|v| v.to_string()),
+                        "last_priority_fee_per_gas": status.nonce_metrics.last_priority_fee_per_gas.map(|v| v.to_string()),
+                        "observed_base_fee": status.nonce_metrics.observed_base_fee.map(|v| v.to_string()),
+                        "last_max_fee_per_gas_gwei": status.nonce_metrics.last_max_fee_per_gas.map(|v| (v / 1_000_000_000).to_string()),
+                        "last_priority_fee_per_gas_gwei": status.nonce_metrics.last_priority_fee_per_gas.map(|v| (v / 1_000_000_000).to_string()),
+                        "observed_base_fee_gwei": status.nonce_metrics.observed_base_fee.map(|v| (v / 1_000_000_000).to_string())
+                    }
                 });
 
                 let status_code = if is_healthy { 200 } else { 503 };
@@ -524,17 +1181,42 @@ async fn start_health_server(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    // Initialize tracing
     tracing_subscriber::fmt::init();
-
-    // Parse command line arguments
     let args = Args::parse();
 
-    // Create the admin service
-    let service = AdminService::new(&args).await?;
-    let update_interval = Duration::from_secs(args.update_interval);
+    // Bitcoin RPC selection (unchanged)
+    let bitcoin_rpc: Arc<dyn BitcoinRpcClient> = match args
+        .parse_connection_type()
+        .map_err(std::io::Error::other)?
+        .as_str()
+    {
+        "bitcoincore" => Arc::new(BitcoinCoreRpcClient::new(
+            &args.btc_rpc_url,
+            &args.btc_rpc_user,
+            &args.btc_rpc_password,
+        )?),
+        "external" => Arc::new(ExternalRpcClient::new(
+            args.btc_rpc_url.clone(),
+            args.btc_rpc_user.clone(),
+            args.btc_rpc_password.clone(),
+        )),
+        _ => unreachable!(),
+    };
 
-    // Get health status for the health server
+    // Wallet & provider (exactly once)
+    let signer: PrivateKeySigner = args.admin_private_key.trim_start_matches("0x").parse()?;
+    let wallet = EthereumWallet::from(signer);
+    let url = args.sequencer_rpc_url.parse()?;
+
+    let provider = alloy::providers::ProviderBuilder::new()
+        .wallet(wallet.clone())
+        .connect_http(url);
+
+    // Type of `provider` is concrete and satisfies the bounds.
+    let service = SyncService::new_with(&args, bitcoin_rpc, provider).await?;
+
+    // rest unchanged...
+    let update_interval = Duration::from_secs(args.update_interval);
     let health_status = service.get_health_status();
     let health_port = args.health_port;
 
@@ -543,15 +1225,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         health_port
     );
 
-    // Run both the sync service and health server concurrently
     tokio::select! {
-        _ = service.run(update_interval) => {
-            warn!("Sync service exited unexpectedly");
-        }
+        _ = service.run(update_interval) => warn!("Sync service exited unexpectedly"),
         result = start_health_server(health_status, health_port) => {
-            if let Err(e) = result {
-                warn!("Health server failed: {e}");
-            }
+            if let Err(e) = result { warn!("Health server failed: {e}"); }
         }
     }
 

@@ -1,14 +1,29 @@
 # Sova Bitcoin Sync Service
 
-A service that synchronizes Bitcoin blockchain data to the Sova L1 smart contract. It fetches the latest Bitcoin block information and updates the `SovaL1Block` contract with block height and hash data.
+A service that synchronizes Bitcoin blockchain data to the Sova L2 `SovaL1Block` smart contract. It fetches the latest Bitcoin block information and updates the `SovaL1Block` contract with block height and hash data.
 
 ## Features
 
-- **Bitcoin RPC Integration**: Connects to Bitcoin node via RPC to fetch block data
-- **Smart Contract Updates**: Automatically updates the Sova L1 contract with Bitcoin block information
-- **Health Monitoring**: Built-in health check endpoints for monitoring service status
-- **Configurable Confirmations**: Uses confirmed blocks (default: 6 blocks back) for reliability
-- **Automatic Syncing**: Runs continuously with configurable update intervals
+- **Dual Bitcoin RPC modes**
+  - `bitcoincore` — native JSON-RPC via `bitcoincore_rpc`
+  - `external` — generic JSON-RPC over `reqwest` with clear error surfacing
+- **Contract synchronization**
+  - Automatically updates the `SovaL1Block` contract with confirmed Bitcoin block data
+- **Resilient gas & fee policy**
+  - EIP-1559 estimation from `eth_feeHistory(… pending, p50)`
+  - Fallback to `maxPriorityFeePerGas + pending.baseFee`
+  - **Automatic RBF** on stuck or underpriced txs, with configurable timeout and max attempts
+- **Nonce & duplication safety**
+  - Caps to a single in-flight transaction
+  - Deduplicates by BTC state `(confirmed_height, block_hash)`
+  - Self-heals on “nonce too low” / “already known”
+- **Health monitoring**
+  - Built-in endpoints: `/live`, `/ready`, `/health`
+  - Exposes status, last errors, gas/nonce metrics, observed base fee, and uptime
+- **Fault tolerance**
+  - Exponential backoff with jitter on transient RPC errors
+- **Configurable confirmations**
+  - Uses N-blocks back (default: 6) for safe BTC finality
 
 ## Quick Start
 
@@ -17,7 +32,7 @@ A service that synchronizes Bitcoin blockchain data to the Sova L1 smart contrac
 - Rust (latest stable version)
 - Access to a Bitcoin RPC node
 - Access to a Sova sequencer RPC endpoint
-- Admin private key for contract interactions
+- Admin private key (must be provided via `ADMIN_PRIVATE_KEY` env var)
 
 ### Build
 
@@ -28,24 +43,27 @@ cargo build --release
 ## Run
 
 ```bash
-# Set your admin private key
-export ADMIN_PRIVATE_KEY="your_private_key_without_0x_prefix"
+# 1) Provide the admin key (no 0x prefix)
+export ADMIN_PRIVATE_KEY="aaaaaaaa...bbbb"
 
-# Run with default settings
+# 2) Run with defaults (regtest-friendly)
 cargo run
 
-# Or with custom parameters
+# 3) Or customize:
 cargo run -- \
   --btc-rpc-url "http://your-bitcoin-node:8332" \
-  --btc-rpc-user "your_user" \
-  --btc-rpc-password "your_password" \
-  --rpc-connection-type "bitcoincore" \
-  --sequencer-rpc-url "http://your-sova-node:8545" \
+  --btc-rpc-user "rpcuser" \
+  --btc-rpc-password "rpcpass" \
+  --rpc-connection-type external \
+  --sequencer-rpc-url "http://your-sova-reth:8545" \
   --contract-address "0x2100000000000000000000000000000000000015" \
-  --update-interval 30
+  --update-interval 30 \
+  --confirmation-blocks 6 \
+  --health-port 8080 \
+  --rbf-timeout-seconds 60
 ```
 
-  ## Configuration
+## Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -59,27 +77,90 @@ cargo run -- \
 | `--update-interval` | `10` | Update interval in seconds |
 | `--confirmation-blocks` | `6` | Number of confirmation blocks |
 | `--health-port` | `8080` | Health check server port |
+| `--rbf-timeout-seconds` | `60` | Pending window before attempting RBF |
 
-## Health Check Endpoints
+## In-code gas constants
+- MIN_TIP = 1 gwei
+- MAX_FEE_CAP = 200 gwei
+- DEFAULT_BASE_FEE = 1 gwei (fallback)
+- BUMP_MULTIPLIER = 15% per RBF attempt
+- MAX_RBF_ATTEMPTS = 8
 
-The service exposes health check endpoints on the configured port (default: 8080):
+## How it chooses fees (EIP-1559) & handles RBF
 
-- **`GET /health`** - Overall health status with detailed metrics
-- **`GET /ready`** - Readiness check (both Bitcoin and Sova RPCs healthy)
-- **`GET /live`** - Liveness check (service is running)
+### Estimate fees
+- Use `eth_feeHistory(5, pending, [50])`
+  - **Base fee**: last `baseFeePerGas` (pending)
+  - **Tip**: 50th percentile reward
+- **Fallback**: `maxPriorityFeePerGas` + pending block base fee
 
-### Example Health Response
+### Compute `maxFeePerGas`
+- Formula: `(base + tip) * (1 + attempts * BUMP_MULTIPLIER)`
+- Guards:
+  - Must be ≥ `base + tip + 1`
+  - Cap both tip and max fee at `MAX_FEE_CAP`
+
+### RBF (Replace-By-Fee)
+- If a tx is still pending for `--rbf-timeout-seconds`, re-submit with same nonce and bumped fees
+- Stop after `MAX_RBF_ATTEMPTS`
+
+## Nonce & duplication safety
+
+- Only **one** in-flight tx at a time  
+- Deduplicates by BTC state `(confirmed_height, block_hash)` so the same BTC block isn’t posted twice  
+- **“Nonce too low”**: refreshes metrics and reconciles with chain state  
+- **“Already known”**: keeps polling for receipt  
+
+## Health Endpoints
+
+Served on `0.0.0.0:<health-port>`:
+
+- **GET `/live`** — liveness (process running)  
+- **GET `/ready`** — readiness (Bitcoin RPC **and** Sova RPC healthy)  
+- **GET `/health`** — detailed status & metrics (including nonces and gas telemetry)  
+
+### Example `/health` response
 
 ```json
 {
   "status": "healthy",
-  "started_at": 1642694400,
-  "uptime_seconds": 3600,
+  "started_at": 1731540000,
+  "uptime_seconds": 742,
   "bitcoin_rpc_healthy": true,
   "sequencer_rpc_healthy": true,
-  "last_bitcoin_check": 1642698000,
-  "last_contract_update": 1642698000,
-  "total_updates": 360,
-  "last_error": null
+  "last_bitcoin_check": 1731540701,
+  "last_contract_update": 1731540695,
+  "total_updates": 42,
+  "last_error": null,
+  "nonce_metrics": {
+    "nonce_latest": 123,
+    "nonce_pending": 123,
+    "in_flight_count": 0,
+    "last_submitted": {
+      "height": 878000,
+      "hash": "0xabc…def"
+    },
+    "last_mined": {
+      "height": 877994,
+      "hash": "0x123…789"
+    },
+    "last_tx_hash": "0xfeed…beef",
+    "last_rbf_count": 2,
+    "last_max_fee_per_gas": "30000000000",
+    "last_priority_fee_per_gas": "2000000000",
+    "observed_base_fee": "28000000000",
+    "last_max_fee_per_gas_gwei": "30",
+    "last_priority_fee_per_gas_gwei": "2",
+    "observed_base_fee_gwei": "28"
+  }
 }
 ```
+
+## License
+
+This project is licensed under either of:
+
+- [MIT License](LICENSE-MIT)  
+- [Apache License, Version 2.0](LICENSE-APACHE)  
+
+at your option.
