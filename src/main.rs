@@ -1238,7 +1238,10 @@ where
                     // Periodically prune old processed blocks to prevent unbounded growth
                     self.prune_processed(confirmed_height);
 
-                    if let Err(e) = self.update_contract(current_height, confirmed_height, block_hash).await {
+                    if let Err(e) = self
+                        .update_contract(current_height, confirmed_height, block_hash)
+                        .await
+                    {
                         warn!("Failed to update contract: {e}");
                         // Update health status on contract update failure
                         if let Ok(mut status) = self.health_status.write() {
