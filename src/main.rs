@@ -32,7 +32,7 @@ use tracing::{debug, info, warn};
 
 // Gas management constants
 const MAX_RBF_ATTEMPTS: u32 = 8;
-const DEFAULT_BASE_FEE: u128 = 1_000_000_000; // 1 gwei fallback
+const DEFAULT_BASE_FEE: u128 = 10; // 10 wei fallback
 const BUMP_MULTIPLIER: u32 = 15; // 15% increase per RBF
 
 // Processed blocks pruning
@@ -157,7 +157,7 @@ struct Args {
     #[arg(long, default_value = "60")]
     rbf_timeout_seconds: u64,
 
-    /// Minimum tip in gwei (floor for maxPriorityFeePerGas)
+    /// Minimum tip in wei (floor for maxPriorityFeePerGas)
     #[arg(long, default_value = "1")]
     min_tip_gwei: u128,
 
@@ -1448,7 +1448,7 @@ async fn main() -> AnyResult<()> {
 
     // Runtime-configured gas floors/caps from CLI args
     let gas_cfg = GasCfg {
-        min_tip: args.min_tip_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
+        min_tip: args.min_tip_gwei, // wei
         max_fee_cap: args.max_fee_cap_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
     };
 
