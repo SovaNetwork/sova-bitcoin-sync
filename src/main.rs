@@ -41,8 +41,8 @@ const KEEP_WINDOW: u64 = 10_000; // Keep last 10k blocks to prevent unbounded gr
 // Runtime gas configuration
 #[derive(Debug, Clone)]
 struct GasCfg {
-    min_tip: u128,
-    max_fee_cap: u128,
+    min_tip: u128,     // minimum tip in wei
+    max_fee_cap: u128, // maximum fee cap in wei
 }
 
 // SovaL1Block contract interface
@@ -158,12 +158,12 @@ struct Args {
     rbf_timeout_seconds: u64,
 
     /// Minimum tip in wei (floor for maxPriorityFeePerGas)
-    #[arg(long, default_value = "1")]
-    min_tip_gwei: u128,
+    #[arg(long, default_value = "1000000000")]
+    min_tip_wei: u128,
 
-    /// Maximum maxFeePerGas cap in gwei (ceiling for fees)
-    #[arg(long, default_value = "200")]
-    max_fee_cap_gwei: u128,
+    /// Maximum maxFeePerGas cap in wei (ceiling for fees)
+    #[arg(long, default_value = "200000000000")]
+    max_fee_cap_wei: u128,
 }
 
 impl Args {
@@ -1309,6 +1309,8 @@ async fn handle_health_request(
                         "observed_base_fee_gwei": status.nonce_metrics.observed_base_fee.map(|v| (v / 1_000_000_000).to_string())
                     },
                     "gas_policy": {
+                        "min_tip_wei": gas_cfg.min_tip.to_string(),
+                        "max_fee_cap_wei": gas_cfg.max_fee_cap.to_string(),
                         "min_tip_gwei": (gas_cfg.min_tip / 1_000_000_000).to_string(),
                         "max_fee_cap_gwei": (gas_cfg.max_fee_cap / 1_000_000_000).to_string()
                     }
@@ -1441,21 +1443,21 @@ async fn main() -> AnyResult<()> {
     let args = Args::parse();
 
     // Validate CLI flags
-    if args.min_tip_gwei == 0 {
-        bail!("--min-tip-gwei must be > 0");
+    if args.min_tip_wei == 0 {
+        bail!("--min-tip-wei must be > 0");
     }
-    if args.min_tip_gwei > args.max_fee_cap_gwei {
+    if args.min_tip_wei > args.max_fee_cap_wei {
         bail!(
-            "--min-tip-gwei ({}) cannot exceed --max-fee-cap-gwei ({})",
-            args.min_tip_gwei,
-            args.max_fee_cap_gwei
+            "--min-tip-wei ({}) cannot exceed --max-fee-cap-wei ({})",
+            args.min_tip_wei,
+            args.max_fee_cap_wei
         );
     }
 
     // Runtime-configured gas floors/caps from CLI args
     let gas_cfg = GasCfg {
-        min_tip: args.min_tip_gwei,                                       // wei
-        max_fee_cap: args.max_fee_cap_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
+        min_tip: args.min_tip_wei,         // wei
+        max_fee_cap: args.max_fee_cap_wei, // wei
     };
 
     let gwei = |v: u128| format!("{:.3}", (v as f64) / 1_000_000_000f64);
