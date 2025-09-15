@@ -1448,7 +1448,7 @@ async fn main() -> AnyResult<()> {
 
     // Runtime-configured gas floors/caps from CLI args
     let gas_cfg = GasCfg {
-        min_tip: args.min_tip_gwei, // wei
+        min_tip: args.min_tip_gwei,                                       // wei
         max_fee_cap: args.max_fee_cap_gwei.saturating_mul(1_000_000_000), // convert gwei to wei
     };
 
