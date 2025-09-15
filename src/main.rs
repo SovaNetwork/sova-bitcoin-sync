@@ -50,8 +50,6 @@ sol! {
     #[sol(rpc)]
     contract SovaL1Block {
         function setBitcoinBlockData(uint64 blockHeight, bytes32 blockHash) external;
-        function currentBlockHeight() external view returns (uint64);
-        function blockHashSixBlocksBack() external view returns (bytes32);
     }
 }
 
@@ -317,7 +315,6 @@ where
     bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
     confirmation_blocks: u64,
     rbf_timeout_seconds: u64,
-    max_gap_allow: u64,
     health_status: Arc<RwLock<HealthStatus>>,
     processed_blocks: Arc<RwLock<HashSet<BitcoinBlockUpdate>>>,
     in_flight_tx: Arc<RwLock<Option<InFlightTransaction>>>,
@@ -344,7 +341,6 @@ where
             bitcoin_rpc,
             confirmation_blocks: args.confirmation_blocks,
             rbf_timeout_seconds: args.rbf_timeout_seconds,
-            max_gap_allow: args.max_gap_allow,
             health_status: Arc::new(RwLock::new(HealthStatus::new())),
             processed_blocks: Arc::new(RwLock::new(HashSet::new())),
             in_flight_tx: Arc::new(RwLock::new(None)),
@@ -658,23 +654,6 @@ where
         }
     }
 
-    async fn wait_for_confirmation(&self, from: Address, nonce: u64, timeout_seconds: u64) -> AnyResult<bool> {
-        let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-
-        loop {
-            if self.is_transaction_confirmed(from, nonce).await? {
-                return Ok(true);
-            }
-
-            let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - start_time;
-            if elapsed > timeout_seconds {
-                return Ok(false);
-            }
-
-            time::sleep(Duration::from_secs(5)).await;
-        }
-    }
-
     async fn reconcile_nonces_on_start(&self) -> AnyResult<()> {
         let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
@@ -704,43 +683,6 @@ where
         if let Ok(pending) = self.provider.get_transaction_count(from).pending().await {
             if let Ok(mut s) = self.health_status.write() {
                 s.nonce_metrics.nonce_pending = pending;
-            }
-        }
-    }
-
-    async fn check_transaction_receipt(
-        &self,
-        tx_hash: B256,
-    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(15),
-            max_elapsed_time: Some(Duration::from_secs(90)),
-            ..ExponentialBackoff::default()
-        };
-
-        loop {
-            match self.provider.get_transaction_receipt(tx_hash).await {
-                Ok(Some(receipt)) => {
-                    if let Ok(mut status) = self.health_status.write() {
-                        status.nonce_metrics.last_mined_height =
-                            Some(receipt.block_number.unwrap_or_default());
-                        status.nonce_metrics.last_mined_hash = Some(format!(
-                            "0x{}",
-                            hex::encode(receipt.block_hash.unwrap_or_default())
-                        ));
-                    }
-                    return Ok(true);
-                }
-                Ok(None) => return Ok(false),
-                Err(e) => {
-                    warn!("Failed to check transaction receipt: {e}");
-
-                    if let Some(delay) = backoff.next_backoff() {
-                        time::sleep(delay).await;
-                    } else {
-                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
-                    }
-                }
             }
         }
     }
@@ -1199,7 +1141,10 @@ where
                 let from = self.provider.default_signer_address();
                 match self.is_transaction_confirmed(from, tx.nonce).await {
                     Ok(true) => {
-                        info!("Transaction for nonce {} confirmed with blockNumber!", tx.nonce);
+                        info!(
+                            "Transaction for nonce {} confirmed with blockNumber!",
+                            tx.nonce
+                        );
 
                         // Mark block as processed and clear in-flight state
                         self.mark_as_processed(tx.block_update.clone());
@@ -1272,10 +1217,7 @@ where
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to check confirmation for nonce {}: {e}",
-                            tx.nonce
-                        );
+                        warn!("Failed to check confirmation for nonce {}: {e}", tx.nonce);
                     }
                 }
 
