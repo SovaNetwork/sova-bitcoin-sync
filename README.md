@@ -1,6 +1,8 @@
 # Sova Bitcoin Sync Service
 
-A service that synchronizes Bitcoin blockchain data to the Sova L2 `SovaL1Block` smart contract. It fetches the latest Bitcoin block information and updates the `SovaL1Block` contract with block height and hash data.
+A synchronization service that fetches the latest Bitcoin block information and sends raw transactions to the Sova Network updating its predeploy contracts.
+
+Read more about state finality and syncronization [here](https://docs.sova.io/technology/execution-client-and-sentinel#bitcoin-finality-via-the-sentinel-api-and-database).
 
 ## Features
 
@@ -8,7 +10,7 @@ A service that synchronizes Bitcoin blockchain data to the Sova L2 `SovaL1Block`
   - `bitcoincore` — native JSON-RPC via `bitcoincore_rpc`
   - `external` — generic JSON-RPC over `reqwest` with clear error surfacing
 - **Contract synchronization**
-  - Automatically updates the `SovaL1Block` contract with confirmed Bitcoin block data
+  - `SovaL1Block`- `setBitcoinBlockData(uint64 _blockHeight, bytes32 _blockHash)`
 - **Resilient gas & fee policy**
   - EIP-1559 estimation from `eth_feeHistory(… pending, p50)`
   - Fallback to `maxPriorityFeePerGas + pending.baseFee`
@@ -30,9 +32,9 @@ A service that synchronizes Bitcoin blockchain data to the Sova L2 `SovaL1Block`
 ### Prerequisites
 
 - Rust (latest stable version)
-- Access to a Bitcoin RPC node
-- Access to a Sova sequencer RPC endpoint
-- Admin private key (must be provided via `ADMIN_PRIVATE_KEY` env var)
+- Bitcoin RPC node endpoint
+- Sova sequencer RPC endpoint
+- Signer private key
 
 ### Build
 
@@ -61,8 +63,8 @@ cargo run -- \
   --confirmation-blocks 6 \
   --health-port 8080 \
   --rbf-timeout-seconds 60 \
-  --min-tip-gwei 2 \
-  --max-fee-cap-gwei 150
+  --min-tip-wei 1000000 \
+  --max-fee-cap-wei 150000000000
 ```
 
 ## Configuration
@@ -80,17 +82,11 @@ cargo run -- \
 | `--confirmation-blocks` | `6` | Number of confirmation blocks |
 | `--health-port` | `8080` | Health check server port |
 | `--rbf-timeout-seconds` | `60` | Pending window before attempting RBF |
-| `--min-tip-gwei` | `1` | Minimum tip in gwei for gas calculations |
-| `--max-fee-cap-gwei` | `200` | Maximum fee cap in gwei for gas calculations |
-
-## Gas Configuration
-
-### Runtime-Configurable Parameters (CLI flags)
-- **--min-tip-gwei** = 1 gwei (default, configurable via CLI)
-- **--max-fee-cap-gwei** = 200 gwei (default, configurable via CLI)
+| `--min-tip-wei` | `1000000000` | Minimum tip in wei for gas calculations (default: 1 gwei) |
+| `--max-fee-cap-wei` | `200000000000` | Maximum fee cap in wei for gas calculations (default: 200 gwei) |
 
 ### Fixed Constants
-- DEFAULT_BASE_FEE = 1 gwei (fallback)
+- DEFAULT_BASE_FEE = 10 wei (fallback)
 - BUMP_MULTIPLIER = 15% per RBF attempt
 - MAX_RBF_ATTEMPTS = 8
 

@@ -157,11 +157,11 @@ struct Args {
     #[arg(long, default_value = "60")]
     rbf_timeout_seconds: u64,
 
-    /// Minimum tip in wei (floor for maxPriorityFeePerGas)
+    /// Minimum tip in wei for gas calculations (default: 1 gwei)
     #[arg(long, default_value = "1000000000")]
     min_tip_wei: u128,
 
-    /// Maximum maxFeePerGas cap in wei (ceiling for fees)
+    /// Maximum fee cap in wei for gas calculations (default: 200 gwei)
     #[arg(long, default_value = "200000000000")]
     max_fee_cap_wei: u128,
 }
