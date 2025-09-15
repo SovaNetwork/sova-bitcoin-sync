@@ -290,7 +290,8 @@ impl BitcoinRpcClient for ExternalRpcClient {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct BitcoinBlockUpdate {
-    confirmed_height: u64, // The actual confirmed block height
+    current_height: u64,   // The current Bitcoin block height to post on chain
+    confirmed_height: u64, // The confirmed block height (current - confirmation_blocks)
     hash: B256,            // Hash at the confirmed height
 }
 
@@ -705,6 +706,7 @@ where
 
     async fn update_contract_with_rbf(
         &self,
+        current_height: u64,
         confirmed_height: u64,
         block_hash: B256,
         nonce: u64,
@@ -712,6 +714,7 @@ where
         last_tip: Option<u128>,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let block_update = BitcoinBlockUpdate {
+            current_height,
             confirmed_height,
             hash: block_hash,
         };
@@ -781,7 +784,7 @@ where
 
             let tx_builder = self
                 .contract
-                .setBitcoinBlockData(confirmed_height, block_hash)
+                .setBitcoinBlockData(current_height, block_hash)
                 .nonce(nonce)
                 .max_fee_per_gas(max_fee)
                 .max_priority_fee_per_gas(tip);
@@ -904,10 +907,12 @@ where
 
     async fn update_contract(
         &self,
+        current_height: u64,
         confirmed_height: u64,
         block_hash: B256,
     ) -> Result<(), Box<dyn Error + Send + Sync>> {
         let block_update = BitcoinBlockUpdate {
+            current_height,
             confirmed_height,
             hash: block_hash,
         };
@@ -926,10 +931,7 @@ where
             }
         }
 
-        let from = self.provider.default_signer_address();
         let nonce_to_use = self.find_available_nonce().await?;
-
-        info!(%from, nonce_to_use, "Using nonce from latest + walk upward method");
 
         info!(
             "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {nonce_to_use})",
@@ -963,7 +965,7 @@ where
 
             let tx_builder = self
                 .contract
-                .setBitcoinBlockData(confirmed_height, block_hash)
+                .setBitcoinBlockData(current_height, block_hash)
                 .nonce(nonce_to_use)
                 .max_fee_per_gas(max_fee)
                 .max_priority_fee_per_gas(tip);
@@ -1198,6 +1200,7 @@ where
                             // Try to re-submit with same nonce but higher gas (RBF)
                             if let Err(e) = self
                                 .update_contract_with_rbf(
+                                    tx.block_update.current_height,
                                     tx.block_update.confirmed_height,
                                     tx.block_update.hash,
                                     tx.nonce,
@@ -1235,7 +1238,7 @@ where
                     // Periodically prune old processed blocks to prevent unbounded growth
                     self.prune_processed(confirmed_height);
 
-                    if let Err(e) = self.update_contract(confirmed_height, block_hash).await {
+                    if let Err(e) = self.update_contract(current_height, confirmed_height, block_hash).await {
                         warn!("Failed to update contract: {e}");
                         // Update health status on contract update failure
                         if let Ok(mut status) = self.health_status.write() {
