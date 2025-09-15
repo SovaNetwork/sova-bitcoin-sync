@@ -50,8 +50,6 @@ sol! {
     #[sol(rpc)]
     contract SovaL1Block {
         function setBitcoinBlockData(uint64 blockHeight, bytes32 blockHash) external;
-        function currentBlockHeight() external view returns (uint64);
-        function blockHashSixBlocksBack() external view returns (bytes32);
     }
 }
 
@@ -166,10 +164,6 @@ struct Args {
     /// Maximum maxFeePerGas cap in gwei (ceiling for fees)
     #[arg(long, default_value = "200")]
     max_fee_cap_gwei: u128,
-
-    /// Maximum nonce gap to allow for automated recovery
-    #[arg(long, default_value = "6000")]
-    max_gap_allow: u64,
 }
 
 impl Args {
@@ -317,7 +311,6 @@ where
     bitcoin_rpc: Arc<dyn BitcoinRpcClient>,
     confirmation_blocks: u64,
     rbf_timeout_seconds: u64,
-    max_gap_allow: u64,
     health_status: Arc<RwLock<HealthStatus>>,
     processed_blocks: Arc<RwLock<HashSet<BitcoinBlockUpdate>>>,
     in_flight_tx: Arc<RwLock<Option<InFlightTransaction>>>,
@@ -344,7 +337,6 @@ where
             bitcoin_rpc,
             confirmation_blocks: args.confirmation_blocks,
             rbf_timeout_seconds: args.rbf_timeout_seconds,
-            max_gap_allow: args.max_gap_allow,
             health_status: Arc::new(RwLock::new(HealthStatus::new())),
             processed_blocks: Arc::new(RwLock::new(HashSet::new())),
             in_flight_tx: Arc::new(RwLock::new(None)),
@@ -596,6 +588,18 @@ where
         Ok((latest, pending))
     }
 
+    async fn find_available_nonce(&self) -> AnyResult<u64> {
+        let from = self.provider.default_signer_address();
+        let mut nonce = self.provider.get_transaction_count(from).latest().await?;
+
+        loop {
+            if !self.tx_known_for_nonce(from, nonce).await.unwrap_or(true) {
+                return Ok(nonce);
+            }
+            nonce += 1;
+        }
+    }
+
     async fn tx_known_for_nonce(&self, from: Address, nonce: u64) -> AnyResult<bool> {
         // Prefer {:#x} for 0x-lowerhex
         let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
@@ -627,6 +631,25 @@ where
         Ok(h)
     }
 
+    async fn is_transaction_confirmed(&self, from: Address, nonce: u64) -> AnyResult<bool> {
+        let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
+        let v: serde_json::Value = self
+            .provider
+            .client()
+            .request("eth_getTransactionBySenderAndNonce", params)
+            .await?;
+
+        if v.is_null() {
+            return Ok(false);
+        }
+
+        if let Some(block_number) = v.get("blockNumber") {
+            Ok(!block_number.is_null())
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn reconcile_nonces_on_start(&self) -> AnyResult<()> {
         let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
@@ -635,19 +658,8 @@ where
 
         let gap_size = pending.saturating_sub(latest);
         if gap_size > 1 {
-            if gap_size > self.max_gap_allow {
-                let err = format!(
-                    "Excessive nonce gap detected: latest={}, pending={}, gap_size={}. Gap exceeds max_gap_allow={}. Refusing to start.",
-                    latest, pending, gap_size, self.max_gap_allow
-                );
-                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow, "Excessive nonce gap; refusing to start");
-                return Err(anyhow!(err));
-            } else {
-                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow,
-                    "Large gap detected (gap={}) ≤ max_gap_allow={}; proceeding to reclaim nonce {} via RBF",
-                    gap_size, self.max_gap_allow, latest);
-                // Do not return Err; proceed. The send path will RBF nonce=latest.
-            }
+            warn!(%from, latest, pending, gap = gap_size,
+                "Gap detected but gap/pending reclaim heuristics are disabled. Service will use proper nonce selection instead.");
         }
 
         info!(%from, "Nonce reconciliation passed");
@@ -667,43 +679,6 @@ where
         if let Ok(pending) = self.provider.get_transaction_count(from).pending().await {
             if let Ok(mut s) = self.health_status.write() {
                 s.nonce_metrics.nonce_pending = pending;
-            }
-        }
-    }
-
-    async fn check_transaction_receipt(
-        &self,
-        tx_hash: B256,
-    ) -> Result<bool, Box<dyn Error + Send + Sync>> {
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(15),
-            max_elapsed_time: Some(Duration::from_secs(90)),
-            ..ExponentialBackoff::default()
-        };
-
-        loop {
-            match self.provider.get_transaction_receipt(tx_hash).await {
-                Ok(Some(receipt)) => {
-                    if let Ok(mut status) = self.health_status.write() {
-                        status.nonce_metrics.last_mined_height =
-                            Some(receipt.block_number.unwrap_or_default());
-                        status.nonce_metrics.last_mined_hash = Some(format!(
-                            "0x{}",
-                            hex::encode(receipt.block_hash.unwrap_or_default())
-                        ));
-                    }
-                    return Ok(true);
-                }
-                Ok(None) => return Ok(false),
-                Err(e) => {
-                    warn!("Failed to check transaction receipt: {e}");
-
-                    if let Some(delay) = backoff.next_backoff() {
-                        time::sleep(delay).await;
-                    } else {
-                        return Err(Box::new(e) as Box<dyn Error + Send + Sync>);
-                    }
-                }
             }
         }
     }
@@ -747,23 +722,20 @@ where
             return Ok(());
         }
 
-        // Validate nonce before sending
-        let (latest, _) = self.get_nonces().await?;
-        let is_valid_nonce = nonce == latest || {
-            if let Ok(in_flight) = self.in_flight_tx.read() {
-                if let Some(ref tx) = *in_flight {
-                    nonce == tx.nonce
-                } else {
-                    false
-                }
+        // Validate nonce before sending - should match the in-flight transaction nonce
+        let is_valid_nonce = if let Ok(in_flight) = self.in_flight_tx.read() {
+            if let Some(ref tx) = *in_flight {
+                nonce == tx.nonce
             } else {
                 false
             }
+        } else {
+            false
         };
 
         if !is_valid_nonce {
             let from = self.provider.default_signer_address();
-            warn!(%from, latest, nonce, "Invalid nonce for RBF; refusing to send");
+            warn!(%from, nonce, "Invalid nonce for RBF; refusing to send");
             return Ok(());
         }
 
@@ -946,7 +918,7 @@ where
             return Ok(());
         }
 
-        // Use pending nonce and cap in-flight = 1
+        // Use proper nonce selection and confirmation gating
         if let Ok(in_flight) = self.in_flight_tx.read() {
             if in_flight.is_some() {
                 debug!("Transaction already in flight, skipping new submission");
@@ -954,43 +926,10 @@ where
             }
         }
 
-        let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
-        let has_tx_latest = self.tx_known_for_nonce(from, latest).await.unwrap_or(false);
+        let nonce_to_use = self.find_available_nonce().await?;
 
-        // New logic: allow send if either there's no tx at latest (we can claim it),
-        // or there IS a tx at latest (we'll RBF it).
-        if !has_tx_latest {
-            info!(%from, latest, pending, "No tx at latest; claiming nonce {}.", latest);
-        } else {
-            info!(%from, latest, pending, "Tx exists at latest; attempting RBF for nonce {}.", latest);
-        }
-        let nonce_to_use = latest; // proceed either way
-
-        // Proactively resolve the unknown hash for metrics before sending
-        if has_tx_latest {
-            if let Ok(Some(hash)) =
-                Self::tx_hash_by_sender_and_nonce(&self.provider, from, latest).await
-            {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if let Ok(mut slot) = self.in_flight_tx.write() {
-                    *slot = Some(InFlightTransaction {
-                        tx_hash: hash,
-                        nonce: latest,
-                        block_update: BitcoinBlockUpdate {
-                            confirmed_height,
-                            hash: block_hash,
-                        },
-                        submitted_at: now,
-                        rbf_count: 0,
-                        last_tip: self.gas.min_tip,
-                    });
-                }
-            }
-        }
+        info!(%from, nonce_to_use, "Using nonce from latest + walk upward method");
 
         info!(
             "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {nonce_to_use})",
@@ -1194,10 +1133,14 @@ where
                     }
                 }
 
-                // Check if the in-flight transaction has been mined
-                match self.check_transaction_receipt(tx.tx_hash).await {
+                // Check if the in-flight transaction has been confirmed using proper confirmation gating
+                let from = self.provider.default_signer_address();
+                match self.is_transaction_confirmed(from, tx.nonce).await {
                     Ok(true) => {
-                        info!("Transaction 0x{} confirmed!", hex::encode(tx.tx_hash));
+                        info!(
+                            "Transaction for nonce {} confirmed with blockNumber!",
+                            tx.nonce
+                        );
 
                         // Mark block as processed and clear in-flight state
                         self.mark_as_processed(tx.block_update.clone());
@@ -1270,10 +1213,7 @@ where
                         }
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to check receipt for 0x{}: {e}",
-                            hex::encode(tx.tx_hash)
-                        );
+                        warn!("Failed to check confirmation for nonce {}: {e}", tx.nonce);
                     }
                 }
 
@@ -1321,7 +1261,6 @@ async fn handle_health_request(
     path: &str,
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: &GasCfg,
-    max_gap_allow: u64,
 ) -> (u16, String) {
     match path {
         "/health" => match health_status.read() {
@@ -1403,15 +1342,12 @@ async fn handle_health_request(
                     .nonce_metrics
                     .nonce_pending
                     .saturating_sub(status.nonce_metrics.nonce_latest);
-                let will_refuse = gap > max_gap_allow;
 
                 let response = json!({
                     "latest": status.nonce_metrics.nonce_latest,
                     "pending": status.nonce_metrics.nonce_pending,
                     "gap": gap,
-                    "max_gap_allow": max_gap_allow,
                     "in_flight": in_flight_info,
-                    "will_refuse_on_start": will_refuse
                 });
 
                 (200, response.to_string())
@@ -1436,7 +1372,6 @@ async fn handle_connection(
     mut stream: TcpStream,
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: &GasCfg,
-    max_gap_allow: u64,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut buffer = [0; 8192]; // Increased for proxy compatibility
     let n = stream.read(&mut buffer).await?;
@@ -1448,8 +1383,7 @@ async fn handle_connection(
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("/");
 
-    let (status_code, body) =
-        handle_health_request(path, health_status, gas_cfg, max_gap_allow).await;
+    let (status_code, body) = handle_health_request(path, health_status, gas_cfg).await;
 
     let status_text = match status_code {
         200 => "OK",
@@ -1477,7 +1411,6 @@ async fn handle_connection(
 async fn start_health_server(
     health_status: Arc<RwLock<HealthStatus>>,
     gas_cfg: GasCfg,
-    max_gap_allow: u64,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let listener = TcpListener::bind(format!("0.0.0.0:{port}")).await?;
@@ -1487,17 +1420,9 @@ async fn start_health_server(
         let (stream, _) = listener.accept().await?;
         let health_status_clone = health_status.clone();
         let gas_cfg_clone = gas_cfg.clone();
-        let max_gap_allow_clone = max_gap_allow;
 
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(
-                stream,
-                health_status_clone,
-                &gas_cfg_clone,
-                max_gap_allow_clone,
-            )
-            .await
-            {
+            if let Err(e) = handle_connection(stream, health_status_clone, &gas_cfg_clone).await {
                 warn!("Error handling health check connection: {}", e);
             }
         });
@@ -1581,7 +1506,7 @@ async fn main() -> AnyResult<()> {
 
     tokio::select! {
         _ = service.run(update_interval) => warn!("Sync service exited unexpectedly"),
-        result = start_health_server(health_status, gas_cfg.clone(), args.max_gap_allow, health_port) => {
+        result = start_health_server(health_status, gas_cfg.clone(), health_port) => {
             if let Err(e) = result { warn!("Health server failed: {e}"); }
         }
     }
