@@ -596,6 +596,18 @@ where
         Ok((latest, pending))
     }
 
+    async fn find_available_nonce(&self) -> AnyResult<u64> {
+        let from = self.provider.default_signer_address();
+        let mut nonce = self.provider.get_transaction_count(from).latest().await?;
+
+        loop {
+            if !self.tx_known_for_nonce(from, nonce).await.unwrap_or(true) {
+                return Ok(nonce);
+            }
+            nonce += 1;
+        }
+    }
+
     async fn tx_known_for_nonce(&self, from: Address, nonce: u64) -> AnyResult<bool> {
         // Prefer {:#x} for 0x-lowerhex
         let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
@@ -627,6 +639,42 @@ where
         Ok(h)
     }
 
+    async fn is_transaction_confirmed(&self, from: Address, nonce: u64) -> AnyResult<bool> {
+        let params = serde_json::json!([format!("{:#x}", from), format!("0x{:x}", nonce)]);
+        let v: serde_json::Value = self
+            .provider
+            .client()
+            .request("eth_getTransactionBySenderAndNonce", params)
+            .await?;
+
+        if v.is_null() {
+            return Ok(false);
+        }
+
+        if let Some(block_number) = v.get("blockNumber") {
+            Ok(!block_number.is_null())
+        } else {
+            Ok(false)
+        }
+    }
+
+    async fn wait_for_confirmation(&self, from: Address, nonce: u64, timeout_seconds: u64) -> AnyResult<bool> {
+        let start_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+        loop {
+            if self.is_transaction_confirmed(from, nonce).await? {
+                return Ok(true);
+            }
+
+            let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() - start_time;
+            if elapsed > timeout_seconds {
+                return Ok(false);
+            }
+
+            time::sleep(Duration::from_secs(5)).await;
+        }
+    }
+
     async fn reconcile_nonces_on_start(&self) -> AnyResult<()> {
         let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
@@ -635,19 +683,8 @@ where
 
         let gap_size = pending.saturating_sub(latest);
         if gap_size > 1 {
-            if gap_size > self.max_gap_allow {
-                let err = format!(
-                    "Excessive nonce gap detected: latest={}, pending={}, gap_size={}. Gap exceeds max_gap_allow={}. Refusing to start.",
-                    latest, pending, gap_size, self.max_gap_allow
-                );
-                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow, "Excessive nonce gap; refusing to start");
-                return Err(anyhow!(err));
-            } else {
-                warn!(%from, latest, pending, gap = gap_size, max_gap = self.max_gap_allow,
-                    "Large gap detected (gap={}) ≤ max_gap_allow={}; proceeding to reclaim nonce {} via RBF",
-                    gap_size, self.max_gap_allow, latest);
-                // Do not return Err; proceed. The send path will RBF nonce=latest.
-            }
+            warn!(%from, latest, pending, gap = gap_size,
+                "Gap detected but gap/pending reclaim heuristics are disabled. Service will use proper nonce selection instead.");
         }
 
         info!(%from, "Nonce reconciliation passed");
@@ -747,23 +784,20 @@ where
             return Ok(());
         }
 
-        // Validate nonce before sending
-        let (latest, _) = self.get_nonces().await?;
-        let is_valid_nonce = nonce == latest || {
-            if let Ok(in_flight) = self.in_flight_tx.read() {
-                if let Some(ref tx) = *in_flight {
-                    nonce == tx.nonce
-                } else {
-                    false
-                }
+        // Validate nonce before sending - should match the in-flight transaction nonce
+        let is_valid_nonce = if let Ok(in_flight) = self.in_flight_tx.read() {
+            if let Some(ref tx) = *in_flight {
+                nonce == tx.nonce
             } else {
                 false
             }
+        } else {
+            false
         };
 
         if !is_valid_nonce {
             let from = self.provider.default_signer_address();
-            warn!(%from, latest, nonce, "Invalid nonce for RBF; refusing to send");
+            warn!(%from, nonce, "Invalid nonce for RBF; refusing to send");
             return Ok(());
         }
 
@@ -946,7 +980,7 @@ where
             return Ok(());
         }
 
-        // Use pending nonce and cap in-flight = 1
+        // Use proper nonce selection and confirmation gating
         if let Ok(in_flight) = self.in_flight_tx.read() {
             if in_flight.is_some() {
                 debug!("Transaction already in flight, skipping new submission");
@@ -954,43 +988,10 @@ where
             }
         }
 
-        let (latest, pending) = self.get_nonces().await?;
         let from = self.provider.default_signer_address();
-        let has_tx_latest = self.tx_known_for_nonce(from, latest).await.unwrap_or(false);
+        let nonce_to_use = self.find_available_nonce().await?;
 
-        // New logic: allow send if either there's no tx at latest (we can claim it),
-        // or there IS a tx at latest (we'll RBF it).
-        if !has_tx_latest {
-            info!(%from, latest, pending, "No tx at latest; claiming nonce {}.", latest);
-        } else {
-            info!(%from, latest, pending, "Tx exists at latest; attempting RBF for nonce {}.", latest);
-        }
-        let nonce_to_use = latest; // proceed either way
-
-        // Proactively resolve the unknown hash for metrics before sending
-        if has_tx_latest {
-            if let Ok(Some(hash)) =
-                Self::tx_hash_by_sender_and_nonce(&self.provider, from, latest).await
-            {
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-                if let Ok(mut slot) = self.in_flight_tx.write() {
-                    *slot = Some(InFlightTransaction {
-                        tx_hash: hash,
-                        nonce: latest,
-                        block_update: BitcoinBlockUpdate {
-                            confirmed_height,
-                            hash: block_hash,
-                        },
-                        submitted_at: now,
-                        rbf_count: 0,
-                        last_tip: self.gas.min_tip,
-                    });
-                }
-            }
-        }
+        info!(%from, nonce_to_use, "Using nonce from latest + walk upward method");
 
         info!(
             "Updating contract with confirmed height {confirmed_height} and hash 0x{} (nonce: {nonce_to_use})",
@@ -1194,10 +1195,11 @@ where
                     }
                 }
 
-                // Check if the in-flight transaction has been mined
-                match self.check_transaction_receipt(tx.tx_hash).await {
+                // Check if the in-flight transaction has been confirmed using proper confirmation gating
+                let from = self.provider.default_signer_address();
+                match self.is_transaction_confirmed(from, tx.nonce).await {
                     Ok(true) => {
-                        info!("Transaction 0x{} confirmed!", hex::encode(tx.tx_hash));
+                        info!("Transaction for nonce {} confirmed with blockNumber!", tx.nonce);
 
                         // Mark block as processed and clear in-flight state
                         self.mark_as_processed(tx.block_update.clone());
@@ -1271,8 +1273,8 @@ where
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to check receipt for 0x{}: {e}",
-                            hex::encode(tx.tx_hash)
+                            "Failed to check confirmation for nonce {}: {e}",
+                            tx.nonce
                         );
                     }
                 }
