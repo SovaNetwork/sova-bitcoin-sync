@@ -156,6 +156,12 @@ Served on `0.0.0.0:<health-port>`:
     "last_max_fee_per_gas_gwei": "30",
     "last_priority_fee_per_gas_gwei": "2",
     "observed_base_fee_gwei": "28"
+  },
+  "wallet": {
+    "balance_wei": "50000000000000000000",
+    "balance_eth": "50.000000",
+    "low_balance_warning": false,
+    "last_balance_check": 1731540701
   }
 }
 ```
